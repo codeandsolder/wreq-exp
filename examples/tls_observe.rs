@@ -13,7 +13,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(response) => {
                 let tls = response.extensions().get::<wreq::tls::TlsInfo>();
                 println!("target={target}");
-                println!("status={} version={:?} uri={} remote={:?}", response.status(), response.version(), response.uri(), response.remote_addr());
+                println!(
+                    "status={} version={:?} uri={} remote={:?}",
+                    response.status(),
+                    response.version(),
+                    response.uri(),
+                    response.remote_addr()
+                );
                 if let Some(info) = tls {
                     println!(
                         "tls={} cipher={:?} group={:?} alpn={:?} resumed={}",
@@ -24,7 +30,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info.session_reused(),
                     );
                 }
-                for name in ["server", "cf-ray", "x-datadome-cid", "x-cache", "x-served-by", "x-amzn-waf-action", "via"] {
+                for name in [
+                    "server",
+                    "cf-ray",
+                    "x-datadome-cid",
+                    "x-cache",
+                    "x-served-by",
+                    "x-amzn-waf-action",
+                    "via",
+                ] {
                     if let Some(value) = response.headers().get(name) {
                         println!("{name}: {}", value.to_str().unwrap_or("<binary>"));
                     }
