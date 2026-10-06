@@ -22,6 +22,11 @@ use compress::CertificateCompressor;
 pub struct TlsInfo {
     pub(crate) peer_certificate: Option<Bytes>,
     pub(crate) peer_certificate_chain: Option<Vec<Bytes>>,
+    pub(crate) protocol_version: &'static str,
+    pub(crate) cipher_suite: Option<&'static str>,
+    pub(crate) negotiated_group: Option<&'static str>,
+    pub(crate) alpn_protocol: Option<Bytes>,
+    pub(crate) session_reused: bool,
 }
 
 impl TlsInfo {
@@ -37,6 +42,36 @@ impl TlsInfo {
         self.peer_certificate_chain
             .as_ref()
             .map(|v| v.iter().map(|b| b.as_ref()))
+    }
+
+    /// Get the negotiated TLS protocol version (for example `TLSv1.3`).
+    #[must_use]
+    pub fn protocol_version(&self) -> &'static str {
+        self.protocol_version
+    }
+
+    /// Get the negotiated cipher suite name.
+    #[must_use]
+    pub fn cipher_suite(&self) -> Option<&'static str> {
+        self.cipher_suite
+    }
+
+    /// Get the negotiated key-exchange group/curve name when available.
+    #[must_use]
+    pub fn negotiated_group(&self) -> Option<&'static str> {
+        self.negotiated_group
+    }
+
+    /// Get the protocol selected by ALPN as raw protocol bytes.
+    #[must_use]
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
+    }
+
+    /// Whether this connection reused a TLS session.
+    #[must_use]
+    pub fn session_reused(&self) -> bool {
+        self.session_reused
     }
 }
 

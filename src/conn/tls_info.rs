@@ -25,6 +25,11 @@ fn extract_tls_info<S>(ssl_stream: &SslStream<S>) -> TlsInfo {
                 .map(Bytes::from)
                 .collect()
         }),
+        protocol_version: ssl.version_str(),
+        cipher_suite: ssl.current_cipher().map(|cipher| cipher.name()),
+        negotiated_group: ssl.curve_name(),
+        alpn_protocol: ssl.selected_alpn_protocol().map(Bytes::copy_from_slice),
+        session_reused: ssl.session_reused(),
     }
 }
 
