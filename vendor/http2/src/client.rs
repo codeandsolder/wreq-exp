@@ -1219,6 +1219,13 @@ impl Builder {
         self
     }
 
+    /// Returns the initial SETTINGS frame this builder will send during the
+    /// HTTP/2 handshake.
+    #[inline]
+    pub fn local_initial_settings(&self) -> &Settings {
+        &self.settings
+    }
+
     /// Sets the HTTP/2 pseudo-header field order for outgoing HEADERS frames.
     ///
     /// This determines the order in which pseudo-header fields (such as `:method`, `:scheme`, etc.)

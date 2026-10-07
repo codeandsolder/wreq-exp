@@ -29,19 +29,36 @@ impl Http2Setting {
 /// evidence.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Http2Info {
+    local_initial_settings: Vec<Http2Setting>,
     peer_initial_settings: Vec<Http2Setting>,
 }
 
 impl Http2Info {
+    /// Initial SETTINGS entries sent by this client, in wire order.
+    #[inline]
+    pub fn local_initial_settings(&self) -> &[Http2Setting] {
+        &self.local_initial_settings
+    }
+
     /// Initial SETTINGS entries received from the peer, in wire order.
     #[inline]
     pub fn peer_initial_settings(&self) -> &[Http2Setting] {
         &self.peer_initial_settings
     }
 
-    pub(crate) fn from_settings(settings: &http2::frame::Settings) -> Self {
-        let peer_initial_settings = settings
-            .observed_settings()
+    pub(crate) fn from_settings(
+        local: &[http2::frame::ObservedSetting],
+        peer: Option<&http2::frame::Settings>,
+    ) -> Self {
+        let local_initial_settings = local
+            .iter()
+            .map(|setting| Http2Setting {
+                id: setting.id(),
+                value: setting.value(),
+            })
+            .collect();
+        let peer_initial_settings = peer
+            .and_then(http2::frame::Settings::observed_settings)
             .unwrap_or_default()
             .iter()
             .map(|setting| Http2Setting {
@@ -50,6 +67,7 @@ impl Http2Info {
             })
             .collect();
         Self {
+            local_initial_settings,
             peer_initial_settings,
         }
     }

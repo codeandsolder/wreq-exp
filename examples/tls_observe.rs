@@ -31,13 +31,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 if let Some(info) = response.extensions().get::<wreq::http2::Http2Info>() {
-                    let settings = info
-                        .peer_initial_settings()
-                        .iter()
-                        .map(|setting| format!("{}={}", setting.id(), setting.value()))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    println!("h2-peer-settings={settings}");
+                    for (side, settings) in [
+                        ("local", info.local_initial_settings()),
+                        ("peer", info.peer_initial_settings()),
+                    ] {
+                        let settings = settings
+                            .iter()
+                            .map(|setting| format!("{}={}", setting.id(), setting.value()))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        println!("h2-{side}-settings={settings}");
+                    }
                 }
                 for name in [
                     "server",
