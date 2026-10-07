@@ -1,6 +1,6 @@
-use std::{error::Error as StdError, fmt, io};
+use std::{error::Error as StdError, fmt, io, net::SocketAddr};
 
-use http::Uri;
+use http::{Extensions, Uri};
 use wreq_proto::ext::ReasonPhrase;
 
 use crate::{StatusCode, util::Escape};
@@ -205,6 +205,37 @@ impl Error {
     #[inline]
     pub fn is_request(&self) -> bool {
         matches!(self.inner.kind, Kind::Request)
+    }
+
+    /// Returns transport metadata captured before this request failed.
+    ///
+    /// This is available when the request reached an established connection before
+    /// failing. The returned extensions can contain the same connection-scoped
+    /// observation types that successful responses expose, such as
+    /// [`crate::tls::TlsInfo`] and [`crate::http2::Http2Info`].
+    pub fn connection_extensions(&self) -> Option<Extensions> {
+        use crate::client::layer::client::Error as ClientError;
+
+        let mut source = self.source();
+        while let Some(err) = source {
+            if let Some(err) = err.downcast_ref::<ClientError>()
+                && let Some(info) = err.connect_info()
+            {
+                let mut extensions = Extensions::new();
+                info.set_extras(&mut extensions);
+                return Some(extensions);
+            }
+            source = err.source();
+        }
+        None
+    }
+
+    /// Returns the remote address of the established connection, when one was
+    /// captured before this request failed.
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.connection_extensions()?
+            .get::<crate::conn::http::HttpInfo>()
+            .map(crate::conn::http::HttpInfo::remote_addr)
     }
 
     /// Returns true if the error is related to connect

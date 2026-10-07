@@ -1042,6 +1042,11 @@ impl Error {
     }
 
     #[inline]
+    pub(crate) fn connect_info(&self) -> Option<&Connected> {
+        self.connect_info.as_ref()
+    }
+
+    #[inline]
     fn with_connect_info(self, connect_info: Connected) -> Self {
         Self {
             connect_info: Some(connect_info),
