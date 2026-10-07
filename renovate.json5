@@ -3,10 +3,16 @@
   "extends": ["config:recommended"],
   "timezone": "Europe/Warsaw",
   "dependencyDashboard": true,
-  "labels": ["dependencies"],
   "schedule": ["before 6am on monday"],
   "prConcurrentLimit": 10,
+  "ignorePaths": ["vendor/**"],
   "packageRules": [
+    {
+      "description": "Keep the vendored transport stack pinned until it is rebased deliberately",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["http2", "wreq-proto", "wreq-rt"],
+      "enabled": false
+    },
     {
       "description": "Group routine Rust dependency updates",
       "matchManagers": ["cargo"],
