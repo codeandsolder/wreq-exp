@@ -47,6 +47,7 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
+    http2_info::Http2Info,
     rt::{Executor, Timer},
 };
 
@@ -311,24 +312,34 @@ where
             }
         }
 
-        let mut res = match pooled.try_send_request(req).await {
+        let send_result = pooled.try_send_request(req).await;
+        let http2_info = pooled.http2_info();
+        let mut res = match send_result {
             Ok(res) => res,
             Err(mut err) => {
+                let connect_info = match http2_info {
+                    Some(info) => pooled.conn_info.clone().extra(info),
+                    None => pooled.conn_info.clone(),
+                };
                 return if let Some(req) = err.take_message() {
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
                         error: Error::new(ErrorKind::Canceled, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                            .with_connect_info(connect_info),
                         req,
                     })
                 } else {
                     Err(TrySendError::Nope(
                         Error::new(ErrorKind::SendRequest, err.into_error())
-                            .with_connect_info(pooled.conn_info.clone()),
+                            .with_connect_info(connect_info),
                     ))
                 };
             }
         };
+
+        if let Some(info) = http2_info {
+            res.extensions_mut().insert(info);
+        }
 
         #[cfg(feature = "cookies")]
         if let Some(cookie_store) = cookie_store {
@@ -746,6 +757,15 @@ impl<B> PoolClient<B> {
         match self.tx {
             PoolTx::Http1(ref tx) => tx.is_ready(),
             PoolTx::Http2(ref tx) => tx.is_ready(),
+        }
+    }
+
+    fn http2_info(&self) -> Option<Http2Info> {
+        match &self.tx {
+            PoolTx::Http1(_) => None,
+            PoolTx::Http2(tx) => tx
+                .remote_initial_settings()
+                .map(|settings| Http2Info::from_settings(&settings)),
         }
     }
 }

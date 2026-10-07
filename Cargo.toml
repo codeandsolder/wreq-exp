@@ -92,7 +92,7 @@ prefix-symbols = ["btls/prefix-symbols"]
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"
-http2 = "0.5.17"
+http2 = { version = "0.5.20", path = "vendor/http2" }
 httparse = "1.10.1"
 http-body = "1.0.1"
 http-body-util = "0.1.4"
@@ -107,8 +107,8 @@ btls-sys = "0.5.6"
 tokio-btls = "0.5.6"
 tokio = { version = "1.52.3", default-features = false }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
-wreq-rt = { version = "0.2.2-rc.2", default-features = false }
-wreq-proto = { version = "0.2.3", default-features = false }
+wreq-rt = { version = "0.2.2-rc.4", path = "vendor/wreq-rt", default-features = false }
+wreq-proto = { version = "0.2.6", path = "vendor/wreq-proto", default-features = false }
 tower = { version = "0.5.3", default-features = false, features = [
     "timeout",
     "util",
@@ -175,7 +175,7 @@ system-configuration = { version = "0.8.0", optional = true }
 libc = "0.2.186"
 
 [dev-dependencies]
-wreq-rt = { version = "0.2.2-rc.1", features = ["tokio-rt", "compio-rt"] }
+wreq-rt = { version = "0.2.2-rc.4", path = "vendor/wreq-rt", features = ["tokio-rt", "compio-rt"] }
 tokio = { version = "1.0", default-features = false, features = [
     "macros",
     "rt-multi-thread",
@@ -383,3 +383,5 @@ required-features = ["compio-rt"]
 btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
 btls-sys = { git = "https://github.com/0x676e67/btls", branch = "main" }
 tokio-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
+[workspace]
+exclude = ["vendor/http2", "vendor/wreq-proto", "vendor/wreq-rt"]

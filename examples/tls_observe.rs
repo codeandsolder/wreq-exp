@@ -30,6 +30,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info.session_reused(),
                     );
                 }
+                if let Some(info) = response.extensions().get::<wreq::http2::Http2Info>() {
+                    let settings = info
+                        .peer_initial_settings()
+                        .iter()
+                        .map(|setting| format!("{}={}", setting.id(), setting.value()))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    println!("h2-peer-settings={settings}");
+                }
                 for name in [
                     "server",
                     "cf-ray",

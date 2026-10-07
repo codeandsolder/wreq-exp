@@ -308,6 +308,7 @@ mod client;
 mod conn;
 mod error;
 mod group;
+mod http2_info;
 mod into_uri;
 mod proxy;
 mod rt;
@@ -356,6 +357,8 @@ pub mod http2 {
         SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
     };
     pub use wreq_proto::http2::{Http2Options, Http2OptionsBuilder};
+
+    pub use crate::http2_info::{Http2Info, Http2Setting};
 }
 
 pub use http::{Method, StatusCode, Uri, Version};
