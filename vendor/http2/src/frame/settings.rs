@@ -312,6 +312,22 @@ impl Settings {
         self.observed_settings.as_deref()
     }
 
+    /// Returns the settings this frame will encode, in wire order.
+    ///
+    /// Unlike [`Settings::observed_settings`], which is populated only for a
+    /// decoded peer frame, this derives the local encoder output from the
+    /// configured settings and their explicit order.
+    pub fn encoded_settings(&self) -> Vec<ObservedSetting> {
+        let mut out = Vec::new();
+        self.for_each(|setting| {
+            out.push(ObservedSetting {
+                id: u16::from(setting.id),
+                value: setting.value,
+            });
+        });
+        out
+    }
+
     pub fn initial_window_size(&self) -> Option<u32> {
         self.initial_window_size
     }
@@ -727,6 +743,32 @@ mod tests {
         let order = SettingsOrder::builder().extend(expected_order).build();
         assert_eq!(order.ids.len(), expected_order.len());
         assert_eq!(order.ids.as_slice(), expected_order);
+    }
+
+    #[test]
+    fn test_encoded_settings_preserve_configured_wire_order() {
+        let mut settings = Settings::default();
+        settings.set_max_concurrent_streams(Some(100));
+        settings.set_initial_window_size(Some(65_536));
+        settings.set_enable_push(false);
+        settings.set_max_frame_size(None);
+        settings.set_max_header_list_size(None);
+        settings.set_settings_order(
+            SettingsOrder::builder()
+                .extend([
+                    SettingId::MaxConcurrentStreams,
+                    SettingId::InitialWindowSize,
+                    SettingId::EnablePush,
+                ])
+                .build(),
+        );
+
+        let encoded = settings.encoded_settings();
+        let pairs = encoded
+            .iter()
+            .map(|setting| (setting.id(), setting.value()))
+            .collect::<Vec<_>>();
+        assert_eq!(pairs, vec![(3, 100), (4, 65_536), (2, 0)]);
     }
 
     #[test]

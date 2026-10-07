@@ -763,9 +763,13 @@ impl<B> PoolClient<B> {
     fn http2_info(&self) -> Option<Http2Info> {
         match &self.tx {
             PoolTx::Http1(_) => None,
-            PoolTx::Http2(tx) => tx
-                .remote_initial_settings()
-                .map(|settings| Http2Info::from_settings(&settings)),
+            PoolTx::Http2(tx) => {
+                let peer = tx.remote_initial_settings();
+                Some(Http2Info::from_settings(
+                    tx.local_initial_settings(),
+                    peer.as_ref(),
+                ))
+            }
         }
     }
 }

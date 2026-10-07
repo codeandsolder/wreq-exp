@@ -27,6 +27,7 @@ use crate::{
 /// The sender side of an established connection.
 pub struct SendRequest<B> {
     dispatch: dispatch::UnboundedSender<Request<B>, Response<Incoming>>,
+    local_initial_settings: Arc<[http2::frame::ObservedSetting]>,
     remote_initial_settings: Arc<Mutex<Option<http2::frame::Settings>>>,
 }
 
@@ -35,6 +36,7 @@ impl<B> Clone for SendRequest<B> {
     fn clone(&self) -> SendRequest<B> {
         SendRequest {
             dispatch: self.dispatch.clone(),
+            local_initial_settings: self.local_initial_settings.clone(),
             remote_initial_settings: self.remote_initial_settings.clone(),
         }
     }
@@ -107,6 +109,11 @@ impl<B> SendRequest<B> {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.dispatch.is_closed()
+    }
+
+    /// Returns the initial SETTINGS frame sent by this client.
+    pub fn local_initial_settings(&self) -> &[http2::frame::ObservedSetting] {
+        &self.local_initial_settings
     }
 
     /// Returns the initial SETTINGS frame received from the remote peer, if available.
@@ -314,6 +321,10 @@ where
         );
 
         let (tx, rx) = dispatch::channel();
+        let local_initial_settings: Arc<[http2::frame::ObservedSetting]> = builder
+            .local_initial_settings()
+            .encoded_settings()
+            .into();
         let remote_initial_settings = Arc::new(Mutex::new(None));
         let h2 = proto::http2::client::handshake(
             io,
@@ -328,6 +339,7 @@ where
         Ok((
             SendRequest {
                 dispatch: tx.unbound(),
+                local_initial_settings,
                 remote_initial_settings,
             },
             Connection {
