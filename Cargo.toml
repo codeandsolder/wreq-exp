@@ -102,9 +102,9 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.18.0"
-btls = "0.5.6"
-btls-sys = "0.5.6"
-tokio-btls = "0.5.6"
+btls = { git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
+tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
 tokio = { version = "1.52.3", default-features = false }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 wreq-rt = { version = "0.2.2-rc.4", path = "vendor/wreq-rt", default-features = false }
@@ -379,9 +379,5 @@ name = "rt"
 path = "examples/rt.rs"
 required-features = ["compio-rt"]
 
-[patch.crates-io]
-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
-btls-sys = { git = "https://github.com/0x676e67/btls", branch = "main" }
-tokio-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
 [workspace]
 exclude = ["vendor/http2", "vendor/wreq-proto", "vendor/wreq-rt"]
