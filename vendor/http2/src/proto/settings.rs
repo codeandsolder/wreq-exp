@@ -69,6 +69,7 @@ impl Settings {
                     }
 
                     streams.apply_local_settings(local)?;
+                    streams.mark_remote_initial_settings_ack_received();
                     self.local = Local::Synced;
                     Ok(())
                 }

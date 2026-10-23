@@ -29,6 +29,8 @@ pub struct SendRequest<B> {
     dispatch: dispatch::UnboundedSender<Request<B>, Response<Incoming>>,
     local_initial_settings: Arc<[http2::frame::ObservedSetting]>,
     remote_initial_settings: Arc<Mutex<Option<http2::frame::Settings>>>,
+    remote_first_connection_window_update: Arc<Mutex<Option<(u32, bool)>>>,
+    remote_initial_settings_ack_received: Arc<Mutex<bool>>,
 }
 
 impl<B> Clone for SendRequest<B> {
@@ -38,6 +40,10 @@ impl<B> Clone for SendRequest<B> {
             dispatch: self.dispatch.clone(),
             local_initial_settings: self.local_initial_settings.clone(),
             remote_initial_settings: self.remote_initial_settings.clone(),
+            remote_first_connection_window_update: self
+                .remote_first_connection_window_update
+                .clone(),
+            remote_initial_settings_ack_received: self.remote_initial_settings_ack_received.clone(),
         }
     }
 }
@@ -122,6 +128,23 @@ impl<B> SendRequest<B> {
             .lock()
             .expect("remote settings mutex poisoned")
             .clone()
+    }
+
+    /// Returns the first connection-level WINDOW_UPDATE and whether it arrived
+    /// before the peer acknowledged our initial SETTINGS frame.
+    pub fn remote_first_connection_window_update(&self) -> Option<(u32, bool)> {
+        *self
+            .remote_first_connection_window_update
+            .lock()
+            .expect("remote connection window update mutex poisoned")
+    }
+
+    /// Returns whether the peer acknowledged our initial SETTINGS frame.
+    pub fn remote_initial_settings_ack_received(&self) -> bool {
+        *self
+            .remote_initial_settings_ack_received
+            .lock()
+            .expect("remote settings ack mutex poisoned")
     }
 }
 
@@ -321,11 +344,11 @@ where
         );
 
         let (tx, rx) = dispatch::channel();
-        let local_initial_settings: Arc<[http2::frame::ObservedSetting]> = builder
-            .local_initial_settings()
-            .encoded_settings()
-            .into();
+        let local_initial_settings: Arc<[http2::frame::ObservedSetting]> =
+            builder.local_initial_settings().encoded_settings().into();
         let remote_initial_settings = Arc::new(Mutex::new(None));
+        let remote_first_connection_window_update = Arc::new(Mutex::new(None));
+        let remote_initial_settings_ack_received = Arc::new(Mutex::new(false));
         let h2 = proto::http2::client::handshake(
             io,
             rx,
@@ -334,6 +357,8 @@ where
             self.exec,
             self.timer,
             remote_initial_settings.clone(),
+            remote_first_connection_window_update.clone(),
+            remote_initial_settings_ack_received.clone(),
         )
         .await?;
         Ok((
@@ -341,6 +366,8 @@ where
                 dispatch: tx.unbound(),
                 local_initial_settings,
                 remote_initial_settings,
+                remote_first_connection_window_update,
+                remote_initial_settings_ack_received,
             },
             Connection {
                 inner: (PhantomData, h2),
