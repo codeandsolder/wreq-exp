@@ -768,6 +768,8 @@ impl<B> PoolClient<B> {
                 Some(Http2Info::from_settings(
                     tx.local_initial_settings(),
                     peer.as_ref(),
+                    tx.remote_first_connection_window_update(),
+                    tx.remote_initial_settings_ack_received(),
                 ))
             }
         }

@@ -100,6 +100,13 @@ struct Inner {
 
     /// Initial SETTINGS frame received from the remote peer.
     remote_initial_settings: Option<frame::Settings>,
+
+    /// First connection-level WINDOW_UPDATE received from the remote peer,
+    /// paired with whether it arrived before the peer acknowledged our initial SETTINGS.
+    remote_first_connection_window_update: Option<(u32, bool)>,
+
+    /// Whether the remote peer acknowledged our initial SETTINGS frame.
+    remote_initial_settings_ack_received: bool,
 }
 
 #[derive(Debug)]
@@ -237,6 +244,18 @@ where
 
     pub fn remote_initial_settings(&self) -> Option<frame::Settings> {
         self.inner.lock().remote_initial_settings.clone()
+    }
+
+    pub fn remote_first_connection_window_update(&self) -> Option<(u32, bool)> {
+        self.inner.lock().remote_first_connection_window_update
+    }
+
+    pub fn remote_initial_settings_ack_received(&self) -> bool {
+        self.inner.lock().remote_initial_settings_ack_received
+    }
+
+    pub fn mark_remote_initial_settings_ack_received(&mut self) {
+        self.inner.lock().remote_initial_settings_ack_received = true;
     }
 
     pub fn apply_local_settings(&mut self, frame: &frame::Settings) -> Result<(), Error> {
@@ -469,6 +488,8 @@ impl Inner {
             headers_pseudo_order: config.headers_pseudo_order,
             priorities: config.priorities,
             remote_initial_settings: None,
+            remote_first_connection_window_update: None,
+            remote_initial_settings_ack_received: false,
         }))
     }
 
@@ -726,6 +747,12 @@ impl Inner {
         let send_buffer = &mut *send_buffer;
 
         if id.is_zero() {
+            if self.remote_first_connection_window_update.is_none() {
+                self.remote_first_connection_window_update = Some((
+                    frame.size_increment(),
+                    !self.remote_initial_settings_ack_received,
+                ));
+            }
             self.actions
                 .send
                 .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
