@@ -568,6 +568,17 @@ where
         self.inner.remote_initial_settings()
     }
 
+    /// Returns the first connection-level WINDOW_UPDATE and whether it arrived
+    /// before the peer acknowledged our initial SETTINGS frame.
+    pub fn remote_first_connection_window_update(&self) -> Option<(u32, bool)> {
+        self.inner.remote_first_connection_window_update()
+    }
+
+    /// Returns whether the peer acknowledged our initial SETTINGS frame.
+    pub fn remote_initial_settings_ack_received(&self) -> bool {
+        self.inner.remote_initial_settings_ack_received()
+    }
+
     /// Returns the current max send streams
     pub fn current_max_send_streams(&self) -> usize {
         self.inner.current_max_send_streams()
@@ -1542,6 +1553,17 @@ where
     /// Returns the initial SETTINGS frame received from the remote peer, if available.
     pub fn remote_initial_settings(&self) -> Option<Settings> {
         self.inner.streams().remote_initial_settings()
+    }
+
+    /// Returns the first connection-level WINDOW_UPDATE and whether it arrived
+    /// before the peer acknowledged our initial SETTINGS frame.
+    pub fn remote_first_connection_window_update(&self) -> Option<(u32, bool)> {
+        self.inner.streams().remote_first_connection_window_update()
+    }
+
+    /// Returns whether the peer acknowledged our initial SETTINGS frame.
+    pub fn remote_initial_settings_ack_received(&self) -> bool {
+        self.inner.streams().remote_initial_settings_ack_received()
     }
 }
 

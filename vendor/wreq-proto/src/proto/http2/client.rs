@@ -61,6 +61,8 @@ pub(crate) async fn handshake<T, B, E>(
     mut exec: E,
     timer: Time,
     remote_initial_settings: Arc<Mutex<Option<http2::frame::Settings>>>,
+    remote_first_connection_window_update: Arc<Mutex<Option<(u32, bool)>>>,
+    remote_initial_settings_ack_received: Arc<Mutex<bool>>,
 ) -> Result<ClientTask<B, E, T>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -94,6 +96,8 @@ where
         conn,
         is_terminated: false,
         remote_initial_settings,
+        remote_first_connection_window_update,
+        remote_initial_settings_ack_received,
     };
 
     exec.execute_h2_future(H2ClientFuture::Task {
@@ -162,6 +166,8 @@ pin_project! {
         #[pin]
         is_terminated: bool,
         remote_initial_settings: Arc<Mutex<Option<http2::frame::Settings>>>,
+        remote_first_connection_window_update: Arc<Mutex<Option<(u32, bool)>>>,
+        remote_initial_settings_ack_received: Arc<Mutex<bool>>,
     }
 }
 
@@ -194,6 +200,39 @@ where
                     .remote_initial_settings
                     .lock()
                     .expect("remote settings mutex poisoned") = Some(settings);
+            }
+        }
+        if this
+            .remote_first_connection_window_update
+            .lock()
+            .expect("remote connection window update mutex poisoned")
+            .is_none()
+        {
+            let observed = match this.conn.as_ref().get_ref() {
+                Either::Left(conn) => conn.conn.remote_first_connection_window_update(),
+                Either::Right(conn) => conn.remote_first_connection_window_update(),
+            };
+            if let Some(observation) = observed {
+                *this
+                    .remote_first_connection_window_update
+                    .lock()
+                    .expect("remote connection window update mutex poisoned") = Some(observation);
+            }
+        }
+        if !*this
+            .remote_initial_settings_ack_received
+            .lock()
+            .expect("remote settings ack mutex poisoned")
+        {
+            let observed = match this.conn.as_ref().get_ref() {
+                Either::Left(conn) => conn.conn.remote_initial_settings_ack_received(),
+                Either::Right(conn) => conn.remote_initial_settings_ack_received(),
+            };
+            if observed {
+                *this
+                    .remote_initial_settings_ack_received
+                    .lock()
+                    .expect("remote settings ack mutex poisoned") = true;
             }
         }
         if polled.is_ready() {
