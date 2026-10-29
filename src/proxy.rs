@@ -279,7 +279,7 @@ impl Proxy {
     /// # extern crate wreq;
     /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
     /// let proxy = wreq::Proxy::https("http://localhost:1234")?
-    ///     .no_proxy(wreq::NoProxy::from_string("direct.tld, sub.direct2.tld"));
+    ///     .no_proxy(wreq::NoProxy::from("direct.tld, sub.direct2.tld"));
     /// # Ok(())
     /// # }
     /// # fn main() {}
@@ -328,42 +328,26 @@ impl Proxy {
 
 impl NoProxy {
     /// Returns a new no-proxy configuration based on environment variables (or `None` if no
-    /// variables are set) see [self::NoProxy::from_string()] for the string format
+    /// variables are set) see [`NoProxy::from`] for the string format
     pub fn from_env() -> Option<NoProxy> {
         let raw = std::env::var("NO_PROXY")
             .or_else(|_| std::env::var("no_proxy"))
             .ok()?;
 
-        // Per the docs, this returns `None` if no environment variable is set. We can only reach
-        // here if an env var is set, so we return `Some(NoProxy::default)` if `from_string`
-        // returns None, which occurs with an empty string.
-        Some(Self::from_string(&raw).unwrap_or_default())
+        Some(Self::from(raw.as_str()))
     }
+}
 
-    /// Returns a new no-proxy configuration based on a `no_proxy` string (or `None` if no variables
-    /// are set)
-    /// The rules are as follows:
-    /// * The environment variable `NO_PROXY` is checked, if it is not set, `no_proxy` is checked
-    /// * If neither environment variable is set, `None` is returned
-    /// * Entries are expected to be comma-separated (whitespace between entries is ignored)
-    /// * IP addresses (both IPv4 and IPv6) are allowed, as are optional subnet masks (by adding
-    ///   /size, for example "`192.168.1.0/24`").
-    /// * An entry "`*`" matches all hostnames (this is the only wildcard allowed)
-    /// * Any other entry is considered a domain name (and may contain a leading dot, for example
-    ///   `google.com` and `.google.com` are equivalent) and would match both that domain AND all
-    ///   subdomains.
-    ///
-    /// For example, if `"NO_PROXY=google.com, 192.168.1.0/24"` was set, all the following would
-    /// match (and therefore would bypass the proxy):
-    /// * `http://google.com/`
-    /// * `http://www.google.com/`
-    /// * `http://192.168.1.42/`
-    ///
-    /// The URI `http://notgoogle.com/` would not match.
-    pub fn from_string(no_proxy_list: &str) -> Option<Self> {
-        Some(NoProxy {
+/// Converts a comma-separated `no_proxy` string into a matcher.
+///
+/// Entries may be IPv4/IPv6 addresses with optional subnet masks, `*` to match
+/// every hostname, or domain names (a leading dot is ignored). Whitespace
+/// between entries is ignored.
+impl From<&str> for NoProxy {
+    fn from(no_proxy_list: &str) -> Self {
+        Self {
             inner: no_proxy_list.into(),
-        })
+        }
     }
 }
 
