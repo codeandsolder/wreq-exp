@@ -297,7 +297,7 @@ impl Builder {
         Matcher {
             http: http.or_else(|| all.clone()),
             https: https.or(all),
-            no: NoProxy::from(self.no.as_str()),
+            no: NoProxy::from_string(self.no.as_str()),
             #[cfg(unix)]
             unix: self.unix,
         }
@@ -567,13 +567,13 @@ mod tests {
 
     #[test]
     fn test_no_proxy_wildcard() {
-        let no_proxy = NoProxy::from("*");
+        let no_proxy = NoProxy::from_string("*");
         assert!(no_proxy.contains("any.where"));
     }
 
     #[test]
     fn test_no_proxy_ip_ranges() {
-        let no_proxy = NoProxy::from(".foo.bar, bar.baz,10.42.1.1/24,::1,10.124.7.8,2001::/17");
+        let no_proxy = NoProxy::from_string(".foo.bar, bar.baz,10.42.1.1/24,::1,10.124.7.8,2001::/17");
 
         let should_not_match = [
             // random uri, not in no_proxy
@@ -626,7 +626,7 @@ mod tests {
     fn test_windows_proxy_override_ip_wildcard() {
         let normalized =
             win::normalize_proxy_override("127.*; 10.*.*.*; 192.168.*; 192.168.1.*; *.example.com");
-        let no_proxy = NoProxy::from(normalized.as_str());
+        let no_proxy = NoProxy::from_string(normalized.as_str());
 
         assert!(no_proxy.contains("127.0.0.1"));
         assert!(no_proxy.contains("10.12.34.56"));
@@ -636,7 +636,7 @@ mod tests {
         assert!(!no_proxy.contains("128.0.0.1"));
         assert!(!no_proxy.contains("192.169.42.1"));
 
-        let subnet = NoProxy::from(win::normalize_proxy_override("192.168.1.*").as_str());
+        let subnet = NoProxy::from_string(win::normalize_proxy_override("192.168.1.*").as_str());
         assert!(!subnet.contains("192.168.2.42"));
     }
 
