@@ -573,7 +573,8 @@ mod tests {
 
     #[test]
     fn test_no_proxy_ip_ranges() {
-        let no_proxy = NoProxy::from_string(".foo.bar, bar.baz,10.42.1.1/24,::1,10.124.7.8,2001::/17");
+        let no_proxy =
+            NoProxy::from_string(".foo.bar, bar.baz,10.42.1.1/24,::1,10.124.7.8,2001::/17");
 
         let should_not_match = [
             // random uri, not in no_proxy
