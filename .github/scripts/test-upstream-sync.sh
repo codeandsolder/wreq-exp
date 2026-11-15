@@ -200,6 +200,57 @@ assert_draft
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
 echo "PASS delete/modify conflict retains fork deletion"
 
+setup_case file_directory
+commit_fork_file
+printf 'fork uses file\n' > "$work/region"
+git -C "$work" add .
+git -C "$work" commit --quiet -m 'fork adds file at path'
+git -C "$work" push --quiet origin main
+commit_upstream_file
+mkdir -p "$upstream/region"
+printf 'upstream uses directory\n' > "$upstream/region/child.txt"
+git -C "$upstream" add .
+git -C "$upstream" commit --quiet -m 'upstream adds directory at path'
+git -C "$upstream" push --quiet origin main
+run_sync
+assert_draft
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:region)" == 'fork uses file' ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
+echo "PASS file/directory conflict keeps fork path and unrelated upstream additions"
+
+setup_case directory_file
+commit_fork_file
+mkdir -p "$work/region"
+printf 'fork uses directory\n' > "$work/region/child.txt"
+git -C "$work" add .
+git -C "$work" commit --quiet -m 'fork adds directory at path'
+git -C "$work" push --quiet origin main
+commit_upstream_file
+printf 'upstream uses file\n' > "$upstream/region"
+git -C "$upstream" add .
+git -C "$upstream" commit --quiet -m 'upstream adds file at path'
+git -C "$upstream" push --quiet origin main
+run_sync
+assert_draft
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:region/child.txt)" == 'fork uses directory' ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
+echo "PASS directory/file conflict retains fork subtree"
+
+setup_case unrelated
+commit_fork_file
+git -C "$upstream" checkout --quiet --orphan unrelated
+git -C "$upstream" rm -qrf .
+echo different-history > "$upstream/other-project.txt"
+git -C "$upstream" add .
+git -C "$upstream" commit --quiet -m 'unrelated upstream history'
+git -C "$upstream" push --quiet --force origin HEAD:main
+run_sync
+assert_draft
+assert_main_has_fork_only
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/UNMERGEABLE.md)" == *'manual reconciliation'* ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:fork-only.txt)" == fork ]]
+echo "PASS unrelated upstream history creates actionable draft without deleting fork"
+
 setup_case pending
 commit_fork_file
 commit_upstream_file
