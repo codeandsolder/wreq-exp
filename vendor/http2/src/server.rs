@@ -118,7 +118,7 @@
 use crate::codec::{Codec, UserError};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
 use crate::proto::{self, Config, Error, Prioritized};
-use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
+use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
 
 #[cfg(feature = "tracing")]
 use ::tracing::instrument::{Instrument, Instrumented};
@@ -255,11 +255,19 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
 
+    /// Bytes of frames gathered for one write while DATA frames are coalesced.
+    max_write_buffer_size: Option<usize>,
+
     /// Maximum number of locally reset streams due to protocol error across
     /// the lifetime of the connection.
     ///
     /// When this gets exceeded, we issue GOAWAYs.
     local_max_error_reset_streams: Option<usize>,
+
+    /// connection-level budget for DATA framing overhead.
+    ///
+    /// When this gets exhausted, we issue a GOAWAY with `ENHANCE_YOUR_CALM`.
+    data_frame_budget: proto::DataFrameBudget,
 }
 
 /// Send a response back to the client
@@ -403,6 +411,10 @@ where
             codec.set_max_recv_header_list_size(max as usize);
         }
 
+        if let Some(max) = builder.max_write_buffer_size {
+            codec.set_max_write_buffer_size(max);
+        }
+
         // Send initial settings frame.
         codec
             .buffer(builder.settings.clone().into())
@@ -471,15 +483,18 @@ where
     /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
     /// out until the number of "in flight" bytes drops below `size`.
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. The automatic small-DATA-frame budget is
+    /// updated to match this target. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// See [`FlowControl`] documentation for more details.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
     /// [library level]: ../index.html#flow-control
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     pub fn set_target_window_size(&mut self, size: u32) {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.connection.set_target_window_size(size);
+        self.connection
+            .set_target_window_size(size.min(proto::MAX_WINDOW_SIZE));
     }
 
     /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
@@ -489,15 +504,18 @@ where
     /// remote acknowledges the change.
     ///
     /// This can be used to increase or decrease the window size for existing
-    /// streams.
+    /// streams. A `size` above 2<sup>31</sup> - 1, the largest window
+    /// [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// # Errors
     ///
     /// Returns an error if a previous call is still pending acknowledgement
     /// from the remote endpoint.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.connection.set_initial_window_size(size)?;
+        self.connection
+            .set_initial_window_size(size.min(proto::MAX_WINDOW_SIZE))?;
         Ok(())
     }
 
@@ -580,7 +598,7 @@ where
     ///
     /// This limit is configured by the client peer by sending the
     /// [`SETTINGS_MAX_CONCURRENT_STREAMS` parameter][1] in a `SETTINGS` frame.
-    /// This method returns the currently acknowledged value received from the
+    /// This method returns the latest value received from the
     /// remote.
     ///
     /// [1]: https://tools.ietf.org/html/rfc7540#section-5.1.2
@@ -672,8 +690,9 @@ impl Builder {
             settings: Settings::default(),
             initial_target_connection_window_size: None,
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
-
+            max_write_buffer_size: None,
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
+            data_frame_budget: proto::DataFrameBudget::Auto,
         }
     }
 
@@ -683,9 +702,11 @@ impl Builder {
     /// The initial window of a stream is used as part of flow control. For more
     /// details, see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -707,6 +728,7 @@ impl Builder {
     /// # pub fn main() {}
     /// ```
     pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+        let size = size.min(proto::MAX_WINDOW_SIZE);
         self.settings.set_initial_window_size(Some(size));
         self
     }
@@ -717,9 +739,11 @@ impl Builder {
     /// The initial window of a connection is used as part of flow control. For more details,
     /// see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     ///
     /// # Examples
     ///
@@ -752,7 +776,10 @@ impl Builder {
     /// but any data larger than `max` will be broken up into multiple `DATA`
     /// frames.
     ///
-    /// The value **must** be between 16,384 and 16,777,215. The default value is 16,384.
+    /// `max` is clamped between 16,384 and 16,777,215, the range
+    /// [RFC 9113 §6.5.2] allows. The default value is 16,384.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -773,12 +800,8 @@ impl Builder {
     /// #
     /// # pub fn main() {}
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is not within the legal range specified
-    /// above.
     pub fn max_frame_size(&mut self, max: u32) -> &mut Self {
+        let max = max.clamp(frame::DEFAULT_MAX_FRAME_SIZE, frame::MAX_MAX_FRAME_SIZE);
         self.settings.set_max_frame_size(Some(max));
         self
     }
@@ -824,6 +847,14 @@ impl Builder {
     /// equal to or less than the header table size specified by the sender.
     ///
     /// The default value is 4,096.
+    ///
+    /// # Interoperability
+    ///
+    /// Lowering this below the size currently in use obliges the peer to emit a
+    /// dynamic table size update at the start of its next field block, as
+    /// required by RFC 7541 section 4.2. A peer that omits it is rejected with a
+    /// `COMPRESSION_ERROR` connection error. Leaving this setting unset never
+    /// arms that requirement.
     pub fn header_table_size(&mut self, size: u32) -> &mut Self {
         self.settings.set_header_table_size(Some(size));
         self
@@ -992,13 +1023,25 @@ impl Builder {
     /// will be freed up again.
     ///
     /// The default is currently ~400KB, but may change.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is larger than `u32::MAX`.
     pub fn max_send_buffer_size(&mut self, max: usize) -> &mut Self {
-        assert!(max <= u32::MAX as usize);
         self.max_send_buffer_size = max;
+        self
+    }
+
+    /// Sets how many bytes of frames are gathered for one write.
+    ///
+    /// DATA frames that fit are copied into the write buffer after the frames
+    /// queued before them, so frames of many streams share one write, and with
+    /// TLS fewer records. A frame that does not fit is written with them and
+    /// ends the write.
+    ///
+    /// The buffer grows as needed while streams are open, and returns to 16 KiB
+    /// once the connection has none. Values are clamped to 16 KiB through
+    /// 16 MiB. The default is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
+    ///
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn max_write_buffer_size(&mut self, max: usize) -> &mut Self {
+        self.max_write_buffer_size = Some(max);
         self
     }
 
@@ -1054,6 +1097,29 @@ impl Builder {
     /// [extended CONNECT protocol]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
     pub fn enable_connect_protocol(&mut self) -> &mut Self {
         self.settings.set_enable_connect_protocol(Some(1));
+        self
+    }
+
+    /// Sets a connection-level budget for limiting memory overhead from
+    /// received small DATA frames.
+    ///
+    /// HTTP/2 flow control accounts for DATA payload bytes, but not the
+    /// additional memory required to buffer each DATA frame. An excessive
+    /// number of small frames may therefore consume disproportionate memory.
+    ///
+    /// Small DATA frames consume this budget. The budget is restored when
+    /// buffered frames are consumed by the application, while sufficiently
+    /// large frames may also restore budget. Empty DATA frames are limited
+    /// separately and do not consume this budget.
+    ///
+    /// When this budget is exhausted, the connection is closed with
+    /// `ENHANCE_YOUR_CALM`.
+    ///
+    /// By default, the budget is half the target connection window, with a
+    /// minimum of 25,600 bytes. Changing the target window at runtime also
+    /// updates the permitted framing overhead.
+    pub fn data_frame_budget(&mut self, budget: usize) -> &mut Self {
+        self.data_frame_budget = proto::DataFrameBudget::Configured(budget);
         self
     }
 
@@ -1320,7 +1386,7 @@ impl<B: Buf> SendResponse<B> {
     ///
     /// If the lock on the stream store has been poisoned.
     pub fn stream_id(&self) -> crate::StreamId {
-        crate::StreamId::from_internal(self.inner.stream_id())
+        self.inner.stream_id().into()
     }
 }
 
@@ -1526,9 +1592,12 @@ where
                                 .builder
                                 .local_max_error_reset_streams,
                             settings: self.builder.settings.clone(),
-                            headers_stream_dependency: None,
+                            data_frame_budget: self.builder.data_frame_budget,
+                            headers_priority_policy: proto::HeadersPriorityPolicy::default(),
                             headers_pseudo_order: None,
                             priorities: None,
+                            preface_ping: None,
+                            preface_ping_timeout: None,
                         },
                     );
 
@@ -1655,7 +1724,7 @@ impl proto::Peer for Peer {
         fields: HeaderMap,
         stream_id: StreamId,
     ) -> Result<Self::Poll, Error> {
-        use http::{uri, Version};
+        use http::{Version, uri};
 
         let mut b = Request::builder();
 

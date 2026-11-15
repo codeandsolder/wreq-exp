@@ -19,19 +19,31 @@ rustdoc-args = ["--cfg", "docsrs"]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
-default = ["webpki-roots", "tokio-rt"]
+default = ["webpki-roots", "tokio-rt", "http2"]
+
+# Enable HTTP/2 support (default).
+http2 = ["dep:http2", "netty/http2"]
 
 # Enable tokio as the async runtime (default).
-tokio-rt = ["tokio/rt", "tokio/net", "tokio/fs", "wreq-rt/tokio-rt"]
+tokio-rt = ["tokio/rt", "tokio/time", "tokio/net", "tokio/fs"]
 
 # Enable compio as the async runtime (completion-based, io_uring/IOCP).
-compio-rt = ["dep:compio", "compio?/runtime", "compio?/net", "wreq-rt/compio-rt"]
+compio-rt = [
+    "dep:compio",
+    "compio?/runtime",
+    "compio?/time",
+    "compio?/net",
+    "dep:send_wrapper",
+]
 
 # Enable support for decoding text.
 charset = ["dep:encoding_rs", "dep:mime"]
 
 # Enable cookies store support.
 cookies = ["dep:cookie"]
+
+# Reject cookies scoped to public suffixes using the Public Suffix List.
+cookies-psl = ["cookies", "dep:psl"]
 
 # Enable gzip decompression support.
 gzip = ["dep:tower-http", "tower-http?/decompression-gzip"]
@@ -69,20 +81,20 @@ socks = ["dep:tokio-socks"]
 # Enable WebSocket support.
 ws = ["dep:tokio-tungstenite", "tokio-tungstenite?/handshake"]
 
-# Use static Mozilla root certificates for TLS verification.
+# Use static Mozilla root certificates for TLS verification (default).
 webpki-roots = ["dep:webpki-root-certs"]
 
-# Use static Chromium Root Store certificates for TLS verification (default).
+# Use static Chromium Root Store certificates for TLS verification.
 chromium-roots = ["dep:chromium-roots"]
 
 # Use the system's proxy configuration.
 system-proxy = ["dep:system-configuration", "dep:windows-registry"]
 
 # Enable tracing logging.
-tracing = ["dep:tracing", "wreq-proto/tracing"]
+tracing = ["dep:tracing", "netty/tracing"]
 
 # Enables the `parking_lot` crate for synchronization primitives.
-parking_lot = ["dep:parking_lot", "http2/parking_lot"]
+parking_lot = ["dep:parking_lot", "http2?/parking_lot"]
 
 # Prefix BoringSSL symbols in libcrypto/libssl to avoid linker conflicts
 # when multiple OpenSSL versions coexist in the same process.
@@ -92,7 +104,7 @@ prefix-symbols = ["btls/prefix-symbols"]
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"
-http2 = { version = "0.5.20", path = "vendor/http2" }
+http2 = { version = "0.5.20", path = "vendor/http2", optional = true }
 httparse = "1.10.1"
 http-body = "1.0.1"
 http-body-util = "0.1.4"
@@ -101,14 +113,14 @@ pin-project-lite = "0.2.17"
 futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
-lru = "0.18.0"
-btls = { git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
-btls-sys = { git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
-tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "0f5416d1f61eb4f64a9f2f4d8b867495305d61c1" }
-tokio = { version = "1.52.3", default-features = false }
+lru = "0.19.0"
+btls = "0.5.6"
+btls-sys = "0.5.6"
+tokio-btls = "0.5.6"
+tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
-wreq-rt = { version = "0.2.2-rc.4", path = "vendor/wreq-rt", default-features = false }
-wreq-proto = { version = "0.2.6", path = "vendor/wreq-proto", default-features = false }
+send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
+netty = { version = "0.2.5", path = "vendor/netty", default-features = false }
 tower = { version = "0.5.3", default-features = false, features = [
     "timeout",
     "util",
@@ -140,6 +152,7 @@ chromium-roots = { version = "0.1.1", optional = true }
 
 ## cookies
 cookie = { version = "0.18", optional = true }
+psl = { version = "2.1", optional = true }
 
 ## tower http
 tower-http = { version = "0.7.1", default-features = false, optional = true }
@@ -157,7 +170,7 @@ tokio-util = { version = "0.7.18", default-features = false, optional = true }
 hickory-resolver = { version = "0.26.0", optional = true }
 
 ## parking_lot
-parking_lot = { version = "0.12.5", optional = true }
+parking_lot = { version = "0.13.0", optional = true }
 
 ## tracing
 tracing = { version = "0.1", default-features = false, optional = true }
@@ -175,7 +188,6 @@ system-configuration = { version = "0.8.0", optional = true }
 libc = "0.2.186"
 
 [dev-dependencies]
-wreq-rt = { version = "0.2.2-rc.4", path = "vendor/wreq-rt", features = ["tokio-rt", "compio-rt"] }
 tokio = { version = "1.0", default-features = false, features = [
     "macros",
     "rt-multi-thread",
@@ -200,9 +212,9 @@ tokio-test = "0.4.5"
 tracing = "0.1"
 tracing-subscriber = "0.3.20"
 pretty_env_logger = "0.5"
-brotli = "8.0.2"
+brotli = "9.0.0"
 flate2 = "1.1.9"
-zstd = "0.13.3"
+zstd = "0.14.2"
 
 # for benchmarks
 sysinfo = { version = "0.39.1", default-features = false, features = ["system"] }
@@ -222,49 +234,49 @@ incremental = false
 name = "http1_current_thread"
 path = "bench/http1_current_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http1_multi_thread"
 path = "bench/http1_multi_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http2_current_thread"
 path = "bench/http2_current_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http2_multi_thread"
 path = "bench/http2_multi_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http1_over_tls_current_thread"
 path = "bench/http1_over_tls_current_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http1_over_tls_multi_thread"
 path = "bench/http1_over_tls_multi_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http2_over_tls_current_thread"
 path = "bench/http2_over_tls_current_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[bench]]
 name = "http2_over_tls_multi_thread"
 path = "bench/http2_over_tls_multi_thread.rs"
 harness = false
-required-features = ["tokio-rt", "stream"]
+required-features = ["tokio-rt", "stream", "http2"]
 
 [[test]]
 name = "cookie"
@@ -297,8 +309,18 @@ path = "tests/multipart.rs"
 required-features = ["multipart", "stream"]
 
 [[test]]
+name = "emulate"
+path = "tests/emulate.rs"
+required-features = ["http2"]
+
+[[test]]
 name = "retry"
 path = "tests/retry.rs"
+
+[[test]]
+name = "websocket"
+path = "tests/websocket.rs"
+required-features = ["ws"]
 
 [[example]]
 name = "json_dynamic"
@@ -323,7 +345,7 @@ required-features = ["tracing"]
 [[example]]
 name = "emulate"
 path = "examples/emulate.rs"
-required-features = ["gzip", "brotli", "zstd", "deflate", "tracing"]
+required-features = ["gzip", "brotli", "zstd", "deflate", "tracing", "http2"]
 
 [[example]]
 name = "cert_store"
@@ -346,7 +368,7 @@ required-features = ["socks"]
 [[example]]
 name = "request_with_emulate"
 path = "examples/request_with_emulate.rs"
-required-features = ["gzip", "brotli", "zstd", "deflate", "tracing"]
+required-features = ["gzip", "brotli", "zstd", "deflate", "tracing", "http2"]
 
 [[example]]
 name = "request_with_local_address"
@@ -364,7 +386,7 @@ required-features = ["ws", "futures-util/std"]
 [[example]]
 name = "http2_websocket"
 path = "examples/http2_websocket.rs"
-required-features = ["ws", "futures-util/std"]
+required-features = ["ws", "futures-util/std", "http2"]
 
 [[example]]
 name = "keylog"
@@ -374,10 +396,12 @@ path = "examples/keylog.rs"
 name = "unix_socket"
 path = "examples/unix_socket.rs"
 
-[[example]]
-name = "rt"
-path = "examples/rt.rs"
-required-features = ["compio-rt"]
+[patch.crates-io]
+btls = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
+tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
+http2 = { path = "vendor/http2" }
+netty = { path = "vendor/netty" }
 
 [workspace]
-exclude = ["vendor/http2", "vendor/wreq-proto", "vendor/wreq-rt"]
+exclude = ["vendor/http2", "vendor/netty"]

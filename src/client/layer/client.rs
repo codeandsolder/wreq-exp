@@ -8,6 +8,7 @@ use std::{
     fmt,
     future::Future,
     num::NonZeroUsize,
+    sync::Arc,
     task::{self, Poll},
     time::Duration,
 };
@@ -20,24 +21,26 @@ use http::{
     uri::{Authority, PathAndQuery, Scheme},
 };
 use http_body::Body;
-use pool::Ver;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tower::{BoxError, util::Oneshot};
-use wreq_proto::{
+#[cfg(feature = "http2")]
+use netty::http2::Http2Options;
+use netty::{
     body::Incoming,
     conn::{self, TrySendError as ConnTrySendError},
     http1::Http1Options,
-    http2::Http2Options,
     rt::Executor as _,
 };
+use pool::Ver;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tower::{BoxError, util::Oneshot};
 #[cfg(feature = "cookies")]
 use {
     crate::cookie::{CookieStore, Cookies},
     http::header::COOKIE,
-    std::sync::Arc,
 };
 
 use self::lazy::{Started as Lazy, lazy};
+#[cfg(feature = "http2")]
+use crate::http2_info::Http2Info;
 use crate::{
     client::layer::config::RequestOptions,
     config::RequestConfig,
@@ -47,7 +50,6 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    http2_info::Http2Info,
     rt::{Executor, Timer},
 };
 
@@ -57,14 +59,26 @@ use crate::{
 /// underlying connection pool will be reused.
 #[must_use]
 pub(crate) struct HttpClient<C, B> {
+    inner: Arc<ClientRef<C, B>>,
+}
+
+/// The state every clone of an [`HttpClient`] shares.
+struct ClientRef<C, B> {
     config: Config,
     connector: C,
     exec: Executor,
-    h1_builder: conn::http1::Builder,
-    h2_builder: conn::http2::Builder<Executor>,
+    builders: Builders,
     pool: pool::Pool<PoolClient<B>, ConnectionId>,
     #[cfg(feature = "cookies")]
     cookie_store: RequestConfig<Arc<dyn CookieStore>>,
+}
+
+/// The builders of new connections, one per protocol.
+#[derive(Clone)]
+struct Builders {
+    h1: conn::http1::Builder,
+    #[cfg(feature = "http2")]
+    h2: conn::http2::Builder<Executor>,
 }
 
 #[derive(Clone, Copy)]
@@ -157,7 +171,9 @@ where
                 warn!("CONNECT is not allowed for HTTP/1.0");
                 return Box::pin(future::err(e!(UserUnsupportedRequestMethod).into()));
             }
-            Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2 => {}
+            Version::HTTP_10 | Version::HTTP_11 => {}
+            #[cfg(feature = "http2")]
+            Version::HTTP_2 => {}
             // completely unsupported HTTP version (like HTTP/0.9)!
             _unsupported => {
                 warn!("Request has unsupported version: {:?}", _unsupported);
@@ -173,9 +189,9 @@ where
             }
         };
 
-        let mut this = self.clone();
-
-        // Extract per-request options from the request extensions and apply them to the client.
+        // Extract per-request options from the request extensions. Its own protocol options
+        // apply to a connection opened for it.
+        let mut builders = None;
         let descriptor = {
             let RequestOptions {
                 group,
@@ -183,32 +199,66 @@ where
                 version,
                 tls_options,
                 http1_options,
+                #[cfg(feature = "http2")]
                 http2_options,
                 socket_bind_options,
             } = RequestConfig::<RequestOptions>::remove(req.extensions_mut()).unwrap_or_default();
 
-            if let Some(opts) = http1_options {
-                this.h1_builder = this.h1_builder.options(opts);
+            #[cfg(not(feature = "http2"))]
+            if version == Some(Version::HTTP_2) {
+                warn!("Request requires HTTP/2, but the `http2` feature is disabled");
+                return Box::pin(future::err(e!(UserUnsupportedVersion).into()));
             }
+
+            if let Some(opts) = http1_options {
+                let mut own = builders.unwrap_or_else(|| self.inner.builders.clone());
+                own.h1 = own.h1.options(opts);
+                builders = Some(own);
+            }
+            #[cfg(feature = "http2")]
             if let Some(opts) = http2_options {
-                this.h2_builder = this.h2_builder.options(opts);
+                let mut own = builders.unwrap_or_else(|| self.inner.builders.clone());
+                own.h2 = own.h2.options(opts);
+                builders = Some(own);
             }
 
             ConnectionDescriptor::new(uri, group, proxy, version, tls_options, socket_bind_options)
         };
 
-        Box::pin(this.send_request(req, descriptor).map_err(Into::into))
+        let this = self.inner.clone();
+        let builders = builders.map(Box::new);
+        Box::pin(
+            this.send_request(req, descriptor, builders)
+                .map_err(Into::into),
+        )
     }
+}
 
+// ===== impl ClientRef =====
+
+impl<C, B> ClientRef<C, B>
+where
+    C: tower::Service<ConnectionDescriptor> + Clone + Send + Sync + 'static,
+    C::Response: AsyncRead + AsyncWrite + Connection + Unpin + Send + 'static,
+    C::Error: Into<BoxError>,
+    C::Future: Unpin + Send + 'static,
+    B: Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<BoxError>,
+{
     async fn send_request(
-        self,
+        self: Arc<Self>,
         mut req: Request<B>,
         descriptor: ConnectionDescriptor,
+        builders: Option<Box<Builders>>,
     ) -> Result<Response<Incoming>, Error> {
         let uri = req.uri().clone();
 
         loop {
-            req = match self.try_send_request(req, descriptor.clone()).await {
+            req = match self
+                .try_send_request(req, &descriptor, builders.as_deref())
+                .await
+            {
                 Ok(resp) => return Ok(resp),
                 Err(TrySendError::Nope(err)) => return Err(err),
                 Err(TrySendError::Retryable {
@@ -237,14 +287,20 @@ where
     async fn try_send_request(
         &self,
         mut req: Request<B>,
-        descriptor: ConnectionDescriptor,
+        descriptor: &ConnectionDescriptor,
+        builders: Option<&Builders>,
     ) -> Result<Response<Incoming>, TrySendError<B>> {
-        let mut pooled = self
-            .connection_for(descriptor)
-            .await
-            // `connection_for` already retries checkout errors, so if
-            // it returns an error, there's not much else to retry
-            .map_err(TrySendError::Nope)?;
+        let mut pooled = match self.pool.try_checkout(&descriptor.id()) {
+            // An idle connection is used as it is.
+            Some(pooled) => pooled,
+            // A miss races a checkout against a new connection. That state is boxed, as it
+            // would otherwise sit in the future of every request.
+            None => Box::pin(self.connection_for(descriptor.clone(), builders))
+                .await
+                // `connection_for` already retries checkout errors, so if
+                // it returns an error, there's not much else to retry
+                .map_err(TrySendError::Nope)?,
+        };
 
         let uri = req.uri().clone();
 
@@ -313,14 +369,18 @@ where
         }
 
         let send_result = pooled.try_send_request(req).await;
+        #[cfg(feature = "http2")]
         let http2_info = pooled.http2_info();
         let mut res = match send_result {
             Ok(res) => res,
             Err(mut err) => {
+                #[cfg(feature = "http2")]
                 let connect_info = match http2_info {
                     Some(info) => pooled.conn_info.clone().extra(info),
                     None => pooled.conn_info.clone(),
                 };
+                #[cfg(not(feature = "http2"))]
+                let connect_info = pooled.conn_info.clone();
                 return if let Some(req) = err.take_message() {
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
@@ -337,6 +397,7 @@ where
             }
         };
 
+        #[cfg(feature = "http2")]
         if let Some(info) = http2_info {
             res.extensions_mut().insert(info);
         }
@@ -382,9 +443,10 @@ where
     async fn connection_for(
         &self,
         descriptor: ConnectionDescriptor,
+        builders: Option<&Builders>,
     ) -> Result<pool::Pooled<PoolClient<B>, ConnectionId>, Error> {
         loop {
-            match self.one_connection_for(descriptor.clone()).await {
+            match self.one_connection_for(descriptor.clone(), builders).await {
                 Ok(pooled) => return Ok(pooled),
                 Err(ClientConnectError::Normal(err)) => return Err(err),
                 Err(ClientConnectError::CheckoutIsClosed(reason)) => {
@@ -405,11 +467,12 @@ where
     async fn one_connection_for(
         &self,
         descriptor: ConnectionDescriptor,
+        builders: Option<&Builders>,
     ) -> Result<pool::Pooled<PoolClient<B>, ConnectionId>, ClientConnectError> {
         // Return a single connection if pooling is not enabled
         if !self.pool.is_enabled() {
             return self
-                .connect_to(descriptor)
+                .connect_to(descriptor, builders)
                 .await
                 .map_err(ClientConnectError::Normal);
         }
@@ -425,7 +488,7 @@ where
         //   available first), the started connection future is spawned into the runtime to
         //   complete, and then be inserted into the pool as an idle connection.
         let checkout = self.pool.checkout(descriptor.id());
-        let connect = self.connect_to(descriptor);
+        let connect = self.connect_to(descriptor, builders);
         let is_ver_h2 = self.config.ver == Ver::Http2;
 
         // The order of the `select` is depended on below...
@@ -496,6 +559,7 @@ where
     fn connect_to(
         &self,
         descriptor: ConnectionDescriptor,
+        builders: Option<&Builders>,
     ) -> impl Lazy<Output = Result<pool::Pooled<PoolClient<B>, ConnectionId>, Error>>
     + Send
     + Unpin
@@ -503,12 +567,16 @@ where
         let executor = self.exec.clone();
         let pool = self.pool.clone();
 
-        let h1_builder = self.h1_builder.clone();
-        let h2_builder = self.h2_builder.clone();
+        let Builders {
+            h1: h1_builder,
+            #[cfg(feature = "http2")]
+                h2: h2_builder,
+        } = builders.unwrap_or(&self.builders).clone();
         let ver = match descriptor.version() {
             Some(Version::HTTP_2) => Ver::Http2,
             _ => self.config.ver,
         };
+        #[cfg(feature = "http2")]
         let is_ver_h2 = ver == Ver::Http2;
         let connector = self.connector.clone();
         lazy(move || {
@@ -529,9 +597,19 @@ where
                     .map_err(|src| Error::new(ErrorKind::Connect, src))
                     .and_then(move |io| {
                         let connected = io.connected();
+                        #[cfg(not(feature = "http2"))]
+                        if connected.is_negotiated_h2() {
+                            let err = Error::new(
+                                ErrorKind::Connect,
+                                "ALPN negotiated h2 without HTTP/2 support",
+                            );
+                            return Either::Right(futures_util::future::err(err));
+                        }
+
                         // If ALPN is h2 and we aren't http2_only already,
                         // then we need to convert our pool checkout into
                         // a single HTTP2 one.
+                        #[cfg(feature = "http2")]
                         let connecting = if connected.is_negotiated_h2() && !is_ver_h2 {
                             match connecting.alpn_h2(&pool) {
                                 Some(lock) => {
@@ -541,7 +619,8 @@ where
                                 None => {
                                     // Another connection has already upgraded,
                                     // the pool checkout should finish up for us.
-                                    let canceled =Error::new(ErrorKind::Canceled, "ALPN upgraded to HTTP/2");
+                                    let canceled =
+                                        Error::new(ErrorKind::Canceled, "ALPN upgraded to HTTP/2");
                                     return Either::Right(futures_util::future::err(canceled));
                                 }
                             }
@@ -549,116 +628,18 @@ where
                             connecting
                         };
 
+                        #[cfg(feature = "http2")]
                         let is_h2 = is_ver_h2 || connected.is_negotiated_h2();
 
                         Either::Left(Box::pin(async move {
+                            #[cfg(feature = "http2")]
                             let tx = if is_h2 {
-                               {
-                                    let (mut tx, conn) =
-                                        h2_builder.handshake(io).await.map_err(Error::tx)?;
-
-                                    trace!(
-                                        "http2 handshake complete, spawning background dispatcher task"
-                                    );
-                                    executor.execute(
-                                        conn.map_err(|_e| debug!("client connection error: {}", _e))
-                                            .map(|_| ()),
-                                    );
-
-                                    // Wait for 'conn' to ready up before we
-                                    // declare this tx as usable
-                                    tx.ready().await.map_err(Error::tx)?;
-                                    PoolTx::Http2(tx)
-                                }
+                                PoolTx::http2(h2_builder, &executor, io).await?
                             } else {
-                                 {
-                                    // Perform the HTTP/1.1 handshake on the provided I/O stream. More actions
-                                    // Uses the h1_builder to establish a connection, returning a sender (tx) for requests
-                                    // and a connection task (conn) that manages the connection lifecycle.
-                                    let (mut tx, conn) =
-                                        h1_builder.handshake(io).await.map_err(Error::tx)?;
-
-                                    // Log that the HTTP/1.1 handshake has completed successfully.
-                                    // This indicates the connection is established and ready for request processing.
-                                    trace!(
-                                        "http1 handshake complete, spawning background dispatcher task"
-                                    );
-
-                                    // Create a oneshot channel to communicate errors from the connection task.
-                                    // err_tx sends errors from the connection task, and err_rx receives them
-                                    // to correlate connection failures with request readiness errors.
-                                    let (err_tx, err_rx) = tokio::sync::oneshot::channel();
-                                    // Spawn the connection task in the background using the executor.
-                                    // The task manages the HTTP/1.1 connection, including upgrades (e.g., WebSocket).
-                                    // Errors are sent via err_tx to ensure they can be checked if the sender (tx) fails.
-                                    executor.execute(
-                                        conn.with_upgrades()
-                                                .map_err(|e| {
-                                                // Log the connection error at debug level for diagnostic purposes.
-                                                debug!("client connection error: {:?}", e);
-                                                // Log that the error is being sent to the error channel.
-                                                trace!("sending connection error to error channel");
-                                                // Send the error via the oneshot channel, ignoring send failures
-                                                // (e.g., if the receiver is dropped, which is handled later).
-                                                let _ = err_tx.send(e);
-                                            })
-                                            .map(|_| ()),
-                                    );
-
-                                    // Log that the client is waiting for the connection to be ready.
-                                    // Readiness indicates the sender (tx) can accept a request without blocking. More actions
-                                    trace!("waiting for connection to be ready");
-
-                                    // Check if the sender is ready to accept a request.
-                                    // This ensures the connection is fully established before proceeding.
-                                    // Wait for 'conn' to ready up before we
-                                    // declare this tx as usable
-                                    match tx.ready().await {
-                                        // If ready, the connection is usable for sending requests.
-                                        Ok(_) => {
-                                            // Log that the connection is ready for use.
-                                            trace!("connection is ready");
-                                            // Drop the error receiver, as it’s no longer needed since the sender is ready.
-                                            // This prevents waiting for errors that won’t occur in a successful case.
-                                            drop(err_rx);
-                                            // Wrap the sender in PoolTx::Http1 for use in the connection pool.
-                                            PoolTx::Http1(tx)
-                                        }
-                                        // If the sender fails with a closed channel error, check for a specific connection error.
-                                        // This distinguishes between a vague ChannelClosed error and an actual connection failure.
-                                        Err(e) if e.is_closed() => {
-                                            // Log that the channel is closed, indicating a potential connection issue.
-                                            trace!("connection channel closed, checking for connection error");
-                                            // Check the oneshot channel for a specific error from the connection task.
-                                            match err_rx.await {
-                                                // If an error was received, it’s a specific connection failure.
-                                                Ok(err) => {
-                                                     // Log the specific connection error for diagnostics.
-                                                    trace!("received connection error: {:?}", err);
-                                                    // Return the error wrapped in Error::tx to propagate it.
-                                                    return Err(Error::tx(err));
-                                                }
-                                                // If the error channel is closed, no specific error was sent.
-                                                // Fall back to the vague ChannelClosed error.
-                                                Err(_) => {
-                                                    // Log that the error channel is closed, indicating no specific error.
-                                                    trace!("error channel closed, returning the vague ChannelClosed error");
-                                                    // Return the original error wrapped in Error::tx.
-                                                    return Err(Error::tx(e));
-                                                }
-                                            }
-                                        }
-                                        // For other errors (e.g., timeout, I/O issues), propagate them directly.
-                                        // These are not ChannelClosed errors and don’t require error channel checks.
-                                        Err(e) => {
-                                            // Log the specific readiness failure for diagnostics.
-                                            trace!("connection readiness failed: {:?}", e);
-                                            // Return the error wrapped in Error::tx to propagate it.
-                                            return Err(Error::tx(e));
-                                        }
-                                    }
-                                }
+                                PoolTx::http1(h1_builder, &executor, io).await?
                             };
+                            #[cfg(not(feature = "http2"))]
+                            let tx = PoolTx::http1(h1_builder, &executor, io).await?;
 
                             Ok(pool.pooled(
                                 connecting,
@@ -697,17 +678,10 @@ where
     }
 }
 
-impl<C: Clone, B> Clone for HttpClient<C, B> {
+impl<C, B> Clone for HttpClient<C, B> {
     fn clone(&self) -> HttpClient<C, B> {
         HttpClient {
-            config: self.config,
-            exec: self.exec.clone(),
-            h1_builder: self.h1_builder.clone(),
-            h2_builder: self.h2_builder.clone(),
-            connector: self.connector.clone(),
-            pool: self.pool.clone(),
-            #[cfg(feature = "cookies")]
-            cookie_store: self.cookie_store.clone(),
+            inner: self.inner.clone(),
         }
     }
 }
@@ -720,7 +694,78 @@ struct PoolClient<B> {
 
 enum PoolTx<B> {
     Http1(conn::http1::SendRequest<B>),
+    #[cfg(feature = "http2")]
     Http2(conn::http2::SendRequest<B>),
+}
+
+// ===== impl PoolTx =====
+
+impl<B> PoolTx<B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<BoxError>,
+{
+    /// Performs the HTTP/1 handshake and spawns its connection task.
+    async fn http1<T>(
+        builder: conn::http1::Builder,
+        executor: &Executor,
+        io: T,
+    ) -> Result<Self, Error>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut tx, conn) = builder.handshake(io).await.map_err(Error::tx)?;
+        trace!("http1 handshake complete, spawning background dispatcher task");
+
+        // The connection task reports its error here, so a closed sender can surface the cause.
+        let (err_tx, err_rx) = tokio::sync::oneshot::channel();
+        executor.execute(
+            conn.with_upgrades()
+                .map_err(|e| {
+                    debug!("client connection error: {:?}", e);
+                    let _ = err_tx.send(e);
+                })
+                .map(|_| ()),
+        );
+
+        // Wait for `conn` to ready up before we declare this tx as usable.
+        match tx.ready().await {
+            Ok(()) => Ok(PoolTx::Http1(tx)),
+            Err(e) if e.is_closed() => {
+                trace!("connection channel closed, checking for connection error");
+                Err(Error::tx(err_rx.await.unwrap_or(e)))
+            }
+            Err(e) => {
+                trace!("connection readiness failed: {:?}", e);
+                Err(Error::tx(e))
+            }
+        }
+    }
+
+    /// Performs the HTTP/2 handshake and spawns its connection task.
+    #[cfg(feature = "http2")]
+    async fn http2<T>(
+        builder: conn::http2::Builder<Executor>,
+        executor: &Executor,
+        io: T,
+    ) -> Result<Self, Error>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        B: Unpin,
+        Executor: netty::rt::bounds::Http2ClientConnExec<B, T>,
+    {
+        let (mut tx, conn) = builder.handshake(io).await.map_err(Error::tx)?;
+        trace!("http2 handshake complete, spawning background dispatcher task");
+        executor.execute(
+            conn.map_err(|_e| debug!("client connection error: {}", _e))
+                .map(|_| ()),
+        );
+
+        // Wait for `conn` to ready up before we declare this tx as usable.
+        tx.ready().await.map_err(Error::tx)?;
+        Ok(PoolTx::Http2(tx))
+    }
 }
 
 // ===== impl PoolClient =====
@@ -730,6 +775,7 @@ impl<B> PoolClient<B> {
     fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
         match self.tx {
             PoolTx::Http1(ref mut tx) => tx.poll_ready(cx).map_err(Error::closed),
+            #[cfg(feature = "http2")]
             PoolTx::Http2(_) => Poll::Ready(Ok(())),
         }
     }
@@ -743,6 +789,7 @@ impl<B> PoolClient<B> {
     fn is_http2(&self) -> bool {
         match self.tx {
             PoolTx::Http1(_) => false,
+            #[cfg(feature = "http2")]
             PoolTx::Http2(_) => true,
         }
     }
@@ -756,22 +803,16 @@ impl<B> PoolClient<B> {
     fn is_ready(&self) -> bool {
         match self.tx {
             PoolTx::Http1(ref tx) => tx.is_ready(),
+            #[cfg(feature = "http2")]
             PoolTx::Http2(ref tx) => tx.is_ready(),
         }
     }
 
+    #[cfg(feature = "http2")]
     fn http2_info(&self) -> Option<Http2Info> {
         match &self.tx {
             PoolTx::Http1(_) => None,
-            PoolTx::Http2(tx) => {
-                let peer = tx.remote_initial_settings();
-                Some(Http2Info::from_settings(
-                    tx.local_initial_settings(),
-                    peer.as_ref(),
-                    tx.remote_first_connection_window_update(),
-                    tx.remote_initial_settings_ack_received(),
-                ))
-            }
+            PoolTx::Http2(tx) => Some(Http2Info::from_observation(tx.http2_observation())),
         }
     }
 }
@@ -787,7 +828,13 @@ impl<B: Body + 'static> PoolClient<B> {
         B: Send,
     {
         match self.tx {
-            PoolTx::Http1(ref mut tx) => Either::Left(tx.try_send_request(req)),
+            PoolTx::Http1(ref mut tx) => {
+                let fut = tx.try_send_request(req);
+                #[cfg(feature = "http2")]
+                let fut = Either::Left(fut);
+                fut
+            }
+            #[cfg(feature = "http2")]
             PoolTx::Http2(ref mut tx) => Either::Right(tx.try_send_request(req)),
         }
     }
@@ -809,6 +856,7 @@ where
                 tx: PoolTx::Http1(tx),
             }),
 
+            #[cfg(feature = "http2")]
             PoolTx::Http2(tx) => {
                 let b = PoolClient {
                     conn_info: self.conn_info.clone(),
@@ -835,6 +883,7 @@ pub struct Builder {
     config: Config,
     exec: Executor,
     h1_builder: conn::http1::Builder,
+    #[cfg(feature = "http2")]
     h2_builder: conn::http2::Builder<Executor>,
     pool_config: pool::Config,
     pool_timer: Timer,
@@ -855,6 +904,7 @@ impl Builder {
             },
             exec: exec.clone(),
             h1_builder: conn::http1::Builder::default(),
+            #[cfg(feature = "http2")]
             h2_builder: conn::http2::Builder::new(exec),
             pool_config: pool::Config {
                 idle_timeout: Some(Duration::from_secs(90)),
@@ -911,6 +961,7 @@ impl Builder {
     ///
     /// Default is false.
     #[inline]
+    #[cfg(feature = "http2")]
     pub fn http2_only(mut self, val: bool) -> Self {
         self.config.ver = if val { Ver::Http2 } else { Ver::Auto };
         self
@@ -923,6 +974,7 @@ impl Builder {
     ///
     /// [`http2::client::Builder::timer`]: https://docs.rs/http2/latest/http2/client/struct.Builder.html#method.timer
     #[inline]
+    #[cfg(feature = "http2")]
     pub fn http2_timer(mut self, timer: Timer) -> Self {
         self.h2_builder = self.h2_builder.timer(timer);
         self
@@ -943,6 +995,7 @@ impl Builder {
 
     /// Provide a configuration for HTTP/2.
     #[inline]
+    #[cfg(feature = "http2")]
     pub fn http2_options<O>(mut self, opts: O) -> Self
     where
         O: Into<Option<Http2Options>>,
@@ -981,14 +1034,19 @@ impl Builder {
         let exec = self.exec.clone();
         let timer = self.pool_timer.clone();
         HttpClient {
-            config: self.config,
-            exec: exec.clone(),
-            connector,
-            h1_builder: self.h1_builder,
-            h2_builder: self.h2_builder,
-            pool: pool::Pool::new(self.pool_config, exec, timer),
-            #[cfg(feature = "cookies")]
-            cookie_store: RequestConfig::new(self.cookie_store),
+            inner: Arc::new(ClientRef {
+                config: self.config,
+                exec: exec.clone(),
+                connector,
+                builders: Builders {
+                    h1: self.h1_builder,
+                    #[cfg(feature = "http2")]
+                    h2: self.h2_builder,
+                },
+                pool: pool::Pool::new(self.pool_config, exec, timer),
+                #[cfg(feature = "cookies")]
+                cookie_store: RequestConfig::new(self.cookie_store),
+            }),
         }
     }
 }
@@ -1066,12 +1124,12 @@ impl Error {
     }
 
     #[inline]
-    fn tx(src: wreq_proto::Error) -> Self {
+    fn tx(src: netty::Error) -> Self {
         Self::new(ErrorKind::SendRequest, src)
     }
 
     #[inline]
-    fn closed(src: wreq_proto::Error) -> Self {
+    fn closed(src: netty::Error) -> Self {
         Self::new(ErrorKind::ChannelClosed, src)
     }
 }

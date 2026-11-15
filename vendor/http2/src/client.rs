@@ -10,9 +10,9 @@
 //! This could be as basic as using Tokio's [`TcpStream`] to connect to a remote
 //! host, but usually it means using either ALPN or HTTP/1.1 protocol upgrades.
 //!
-//! Once a connection is obtained, it is passed to [`handshake`], which will
-//! begin the [HTTP/2 handshake]. This returns a future that completes once
-//! the handshake process is performed and HTTP/2 streams may be initialized.
+//! Once a connection is obtained, it is passed to [`handshake`], which prepares
+//! the client-side HTTP/2 state. No transport I/O occurs until the returned
+//! [`Connection`] is polled.
 //!
 //! [`handshake`] uses default configuration values. There are a number of
 //! settings that can be changed by using [`Builder`] instead.
@@ -76,12 +76,7 @@
 //! pub async fn main() -> Result<(), Box<dyn Error>> {
 //!     // Establish TCP connection to the server.
 //!     let tcp = TcpStream::connect("127.0.0.1:5928").await?;
-//!     let (http2, connection) = client::handshake(tcp).await?;
-//!     tokio::spawn(async move {
-//!         connection.await.unwrap();
-//!     });
-//!
-//!     let mut http2 = http2.ready().await?;
+//!     let (mut http2, connection) = client::handshake(tcp).await?;
 //!     // Prepare the HTTP request to send to the server.
 //!     let request = Request::builder()
 //!                     .method(Method::GET)
@@ -92,6 +87,11 @@
 //!     // Send the request. The second tuple item allows the caller
 //!     // to stream a request body.
 //!     let (response, _) = http2.send_request(request, true).unwrap();
+//!     // Queue the first request before starting the connection task so the
+//!     // driver can send it immediately after the initial connection write.
+//!     tokio::spawn(async move {
+//!         connection.await.unwrap();
+//!     });
 //!
 //!     let (head, mut body) = response.await?.into_parts();
 //!
@@ -136,26 +136,33 @@
 //! [`Error`]: ../struct.Error.html
 
 use crate::codec::{Codec, SendError, UserError};
-use crate::ext::Protocol;
+use crate::ext::{HeadersPriority, Protocol};
 #[cfg(feature = "unstable")]
 use crate::frame::ExperimentalSettings;
-use crate::frame::{
-    Headers, Priorities, Pseudo, PseudoOrder, Reason, Settings, SettingsOrder, StreamDependency,
-    StreamId,
-};
+use crate::frame::{Headers, Pseudo, Reason, Settings, StreamId};
 use crate::proto::{self, Error};
-use crate::{tracing, FlowControl, PingPong, RecvStream, SendStream};
+use crate::{FlowControl, PingPong, RecvStream, SendStream, tracing};
+
+pub use crate::frame::{
+    Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, PseudoOrderBuilder, SettingId,
+    SettingsOrder, SettingsOrderBuilder, StreamDependency,
+};
 
 #[cfg(feature = "tracing")]
 use ::tracing::Instrument;
 use bytes::{Buf, Bytes};
-use http::{uri, HeaderMap, Method, Request, Response, Version};
+use http::{HeaderMap, Method, Request, Response, Version, uri};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+// The fixed 24-byte sequence that starts the client connection preface. The
+// initial SETTINGS frame completes the preface.
+// https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
+const CLIENT_MAGIC: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Initializes new HTTP/2 streams on a connection by sending a request.
 ///
@@ -300,8 +307,7 @@ pub struct PushPromises {
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
 ///     -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
 /// # {
-/// // `client_fut` is a future representing the completion of the HTTP/2
-/// // handshake.
+/// // `client_fut` prepares the client-side HTTP/2 state.
 /// let client_fut = Builder::new()
 ///     .initial_window_size(1_000_000)
 ///     .max_concurrent_streams(1000)
@@ -330,6 +336,18 @@ pub struct Builder {
     /// Maximum amount of bytes to "buffer" for writing per stream.
     max_send_buffer_size: usize,
 
+    /// Cap on sent DATA payloads; the peer's max frame size still applies.
+    max_send_data_frame_size: Option<u32>,
+
+    /// Cap on sent header block frame payloads.
+    max_send_header_frame_size: Option<u32>,
+
+    /// Whether each frame after the initial write takes a write of its own.
+    one_frame_per_write: bool,
+
+    /// Bytes of frames gathered for one write while DATA frames are coalesced.
+    max_write_buffer_size: Option<usize>,
+
     /// Maximum number of locally reset streams to keep at a time.
     reset_stream_max: usize,
 
@@ -350,14 +368,28 @@ pub struct Builder {
     /// When this gets exceeded, we issue GOAWAYs.
     local_max_error_reset_streams: Option<usize>,
 
+    /// connection-level budget for DATA framing overhead.
+    ///
+    /// When this gets exhausted, we issue a GOAWAY with `ENHANCE_YOUR_CALM`.
+    data_frame_budget: proto::DataFrameBudget,
+
     /// The headers frame pseudo order
     headers_pseudo_order: Option<PseudoOrder>,
 
-    /// The headers frame stream dependency
-    headers_stream_dependency: Option<StreamDependency>,
+    /// Default priority fields of request `HEADERS` frames
+    headers_priority: Option<HeadersPriority>,
 
     /// Priority stream list
     priorities: Option<Priorities>,
+
+    /// Read-idle threshold for the preface PING
+    preface_ping: Option<Duration>,
+
+    /// Time an unanswered preface PING may go without reads
+    preface_ping_timeout: Option<Duration>,
+
+    /// Initial target receive window size for locally initiated streams.
+    initial_target_stream_window_size: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -554,29 +586,13 @@ where
     ///
     /// This setting is configured by the server peer by sending the
     /// [`SETTINGS_ENABLE_CONNECT_PROTOCOL` parameter][2] in a `SETTINGS` frame.
-    /// This method returns the currently acknowledged value received from the
+    /// This method returns the latest value received from the
     /// remote.
     ///
     /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
     /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
     pub fn is_extended_connect_protocol_enabled(&self) -> bool {
         self.inner.is_extended_connect_protocol_enabled()
-    }
-
-    /// Returns the initial SETTINGS frame received from the remote peer, if available.
-    pub fn remote_initial_settings(&self) -> Option<Settings> {
-        self.inner.remote_initial_settings()
-    }
-
-    /// Returns the first connection-level WINDOW_UPDATE and whether it arrived
-    /// before the peer acknowledged our initial SETTINGS frame.
-    pub fn remote_first_connection_window_update(&self) -> Option<(u32, bool)> {
-        self.inner.remote_first_connection_window_update()
-    }
-
-    /// Returns whether the peer acknowledged our initial SETTINGS frame.
-    pub fn remote_initial_settings_ack_received(&self) -> bool {
-        self.inner.remote_initial_settings_ack_received()
     }
 
     /// Returns the current max send streams
@@ -672,8 +688,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_window_size(1_000_000)
     ///     .max_concurrent_streams(1000)
@@ -686,6 +701,10 @@ impl Builder {
     pub fn new() -> Builder {
         Builder {
             max_send_buffer_size: proto::DEFAULT_MAX_SEND_BUFFER_SIZE,
+            max_send_data_frame_size: None,
+            max_send_header_frame_size: None,
+            one_frame_per_write: false,
+            max_write_buffer_size: None,
             reset_stream_duration: Duration::from_secs(proto::DEFAULT_RESET_STREAM_SECS),
             reset_stream_max: proto::DEFAULT_RESET_STREAM_MAX,
             pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
@@ -694,9 +713,13 @@ impl Builder {
             settings: Default::default(),
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
+            data_frame_budget: proto::DataFrameBudget::Auto,
             headers_pseudo_order: None,
-            headers_stream_dependency: None,
+            headers_priority: None,
             priorities: None,
+            preface_ping: None,
+            preface_ping_timeout: None,
+            initial_target_stream_window_size: None,
         }
     }
 
@@ -706,9 +729,11 @@ impl Builder {
     /// The initial window of a stream is used as part of flow control. For more
     /// details, see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -720,8 +745,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_window_size(1_000_000)
     ///     .handshake(my_io);
@@ -731,6 +755,7 @@ impl Builder {
     /// # pub fn main() {}
     /// ```
     pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+        let size = size.min(proto::MAX_WINDOW_SIZE);
         self.settings.set_initial_window_size(Some(size));
         self
     }
@@ -741,9 +766,11 @@ impl Builder {
     /// The initial window of a connection is used as part of flow control. For more details,
     /// see [`FlowControl`].
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     ///
     /// # Examples
     ///
@@ -755,8 +782,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_connection_window_size(1_000_000)
     ///     .handshake(my_io);
@@ -777,7 +803,10 @@ impl Builder {
     /// but any data larger than `max` will be broken up into multiple `DATA`
     /// frames.
     ///
-    /// The value **must** be between 16,384 and 16,777,215. The default value is 16,384.
+    /// `max` is clamped between 16,384 and 16,777,215, the range
+    /// [RFC 9113 §6.5.2] allows. The default value is 16,384.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     ///
     /// # Examples
     ///
@@ -789,8 +818,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_frame_size(1_000_000)
     ///     .handshake(my_io);
@@ -799,13 +827,102 @@ impl Builder {
     /// #
     /// # pub fn main() {}
     /// ```
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is not within the legal range specified
-    /// above.
     pub fn max_frame_size(&mut self, max: u32) -> &mut Self {
+        let max = max.clamp(
+            crate::frame::DEFAULT_MAX_FRAME_SIZE,
+            crate::frame::MAX_MAX_FRAME_SIZE,
+        );
         self.settings.set_max_frame_size(Some(max));
+        self
+    }
+
+    /// Sets the max payload size of sent DATA frames.
+    ///
+    /// DATA frames stay within `max` even when the peer allows larger frames,
+    /// since endpoints need not use all available space in a frame
+    /// ([RFC 9113 §4.2]). Flow control can only make them smaller. A zero
+    /// `max` is treated as one. Very small values send many small frames,
+    /// which peers may treat as abuse. By default only the peer's
+    /// `SETTINGS_MAX_FRAME_SIZE` applies.
+    ///
+    /// The DATA queued on a stream is also coalesced into frames of up to
+    /// that size, at most 63 non-empty chunks each, without waiting for more,
+    /// as DATA frames carry arbitrary sequences of octets ([RFC 9113 §6.1]).
+    /// Without vectored writes, this needs capped frames of at most 16,384
+    /// bytes; otherwise, as by default, each `send_data` chunk is framed on
+    /// its own.
+    ///
+    /// Each capped frame starts a write and shares none: the frames buffered
+    /// before it are written first, and later ones wait until it is written.
+    /// Small frames, and frames between other frames, thus take more writes,
+    /// and more TLS records with stacks that seal each write separately. With
+    /// 16,375 bytes, a full frame, its 9-byte header included, then fills one
+    /// TLS record of 2^14 bytes ([RFC 8446 §5.1]); a transport that takes the
+    /// write only in part can still seal one more record.
+    ///
+    /// Without vectored writes, a frame of up to 16,384 bytes is copied into
+    /// the write buffer so it takes one write. A larger frame with a
+    /// contiguous chunk of 1 KiB or more takes at least two writes.
+    ///
+    /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
+    /// [RFC 9113 §6.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.1
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn max_send_data_frame_size(&mut self, max: u32) -> &mut Self {
+        self.max_send_data_frame_size = Some(max);
+        self
+    }
+
+    /// Sets the max payload size of sent HEADERS and CONTINUATION frames.
+    ///
+    /// A header block is split into frames of at most `max` bytes even when
+    /// the peer allows larger frames ([RFC 9113 §4.2]). A `max` under 5 is
+    /// treated as 5, which fits the HEADERS priority fields. Small values split
+    /// a block into many CONTINUATION frames, which peers may limit or treat
+    /// as abuse. By default only the peer's `SETTINGS_MAX_FRAME_SIZE` applies.
+    ///
+    /// [RFC 9113 §4.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-4.2
+    pub fn max_send_header_frame_size(&mut self, max: u32) -> &mut Self {
+        self.max_send_header_frame_size = Some(max);
+        self
+    }
+
+    /// Sets whether each frame takes a write of its own.
+    ///
+    /// The connection preface, SETTINGS and the initial WINDOW_UPDATE and
+    /// PRIORITY frames still share the first write. After it, each frame is
+    /// written alone, except that a header block goes out in one write with
+    /// its CONTINUATION frames and the stream WINDOW_UPDATE that follows it.
+    /// TLS stacks commonly seal each write into its own records, though
+    /// [RFC 8446 §5.1] lets them split or coalesce application data.
+    /// Without vectored writes, a DATA frame of up to 16,384 bytes is copied
+    /// so it takes one write; a larger one can take more.
+    ///
+    /// Each frame costs a write, so this lowers throughput when many small
+    /// frames are queued at once. Disabled by default.
+    ///
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn one_frame_per_write(&mut self, enabled: bool) -> &mut Self {
+        self.one_frame_per_write = enabled;
+        self
+    }
+
+    /// Sets how many bytes of frames are gathered for one write.
+    ///
+    /// DATA frames that fit are copied into the write buffer after the frames
+    /// queued before them, so frames of many streams share one write, and with
+    /// TLS fewer records. A frame that does not fit is written with them and
+    /// ends the write. This does not apply with [`max_send_data_frame_size`] or
+    /// [`one_frame_per_write`], whose frames keep writes of their own.
+    ///
+    /// The buffer grows as needed while streams are open, and returns to 16 KiB
+    /// once the connection has none. Values are clamped to 16 KiB through
+    /// 16 MiB. The default is 64 KiB, four full TLS records ([RFC 8446 §5.1]).
+    ///
+    /// [`max_send_data_frame_size`]: Self::max_send_data_frame_size
+    /// [`one_frame_per_write`]: Self::one_frame_per_write
+    /// [RFC 8446 §5.1]: https://www.rfc-editor.org/rfc/rfc8446.html#section-5.1
+    pub fn max_write_buffer_size(&mut self, max: usize) -> &mut Self {
+        self.max_write_buffer_size = Some(max);
         self
     }
 
@@ -829,8 +946,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_header_list_size(16 * 1024)
     ///     .handshake(my_io);
@@ -856,9 +972,10 @@ impl Builder {
     /// 0. If `max` is set to 0, then the remote will not be permitted to
     /// initiate streams.
     ///
-    /// Note that streams in the reserved state, i.e., push promises that have
-    /// been reserved but the stream has not started, do not count against this
-    /// setting.
+    /// Although the HTTP/2 specification excludes streams in the reserved state
+    /// from this limit, `http2` counts reserved push streams against this setting
+    /// to protect resources. This includes push promises whose response streams
+    /// have not yet started.
     ///
     /// Also note that if the remote *does* exceed the value set here, it is not
     /// a protocol level error. Instead, the `http2` library will immediately reset
@@ -878,8 +995,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_concurrent_streams(1000)
     ///     .handshake(my_io);
@@ -904,6 +1020,10 @@ impl Builder {
     /// This setting prevents the caller from exceeding this number of
     /// streams that are counted towards the concurrency limit.
     ///
+    /// Setting this to `0` does not reject an otherwise valid request. The
+    /// request remains pending-open, and its HEADERS are not written until the
+    /// peer's SETTINGS permit another locally initiated stream.
+    ///
     /// Sending streams past the limit returned by the peer will be treated
     /// as a stream error of type PROTOCOL_ERROR or REFUSED_STREAM.
     ///
@@ -924,8 +1044,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .initial_max_send_streams(1000)
     ///     .handshake(my_io);
@@ -969,8 +1088,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_concurrent_reset_streams(1000)
     ///     .handshake(my_io);
@@ -1015,8 +1133,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .reset_stream_duration(Duration::from_secs(10))
     ///     .handshake(my_io);
@@ -1075,8 +1192,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .max_pending_accept_reset_streams(100)
     ///     .handshake(my_io);
@@ -1098,12 +1214,7 @@ impl Builder {
     /// will be freed up again.
     ///
     /// The default is currently ~400KB, but may change.
-    ///
-    /// # Panics
-    ///
-    /// This function panics if `max` is larger than `u32::MAX`.
     pub fn max_send_buffer_size(&mut self, max: usize) -> &mut Self {
-        assert!(max <= u32::MAX as usize);
         self.max_send_buffer_size = max;
         self
     }
@@ -1131,8 +1242,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .enable_push(false)
     ///     .handshake(my_io);
@@ -1164,8 +1274,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .header_table_size(1_000_000)
     ///     .handshake(my_io);
@@ -1174,6 +1283,14 @@ impl Builder {
     /// #
     /// # pub fn main() {}
     /// ```
+    ///
+    /// # Interoperability
+    ///
+    /// Lowering this below the size currently in use obliges the peer to emit a
+    /// dynamic table size update at the start of its next field block, as
+    /// required by RFC 7541 section 4.2. A peer that omits it is rejected with a
+    /// `COMPRESSION_ERROR` connection error. Leaving this setting unset never
+    /// arms that requirement.
     pub fn header_table_size(&mut self, size: u32) -> &mut Self {
         self.settings.set_header_table_size(Some(size));
         self
@@ -1210,31 +1327,57 @@ impl Builder {
         self
     }
 
-    /// Sets the first stream ID to something other than 1.
-    #[cfg(feature = "unstable")]
-    pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
-        self.stream_id = stream_id.into();
-        assert!(
-            self.stream_id.is_client_initiated(),
-            "stream id must be odd"
-        );
+    /// Sets a connection-level budget for limiting memory overhead from
+    /// received small DATA frames.
+    ///
+    /// HTTP/2 flow control accounts for DATA payload bytes, but not the
+    /// additional memory required to buffer each DATA frame. An excessive
+    /// number of small frames may therefore consume disproportionate memory.
+    ///
+    /// Small DATA frames consume this budget. The budget is restored when
+    /// buffered frames are consumed by the application, while sufficiently
+    /// large frames may also restore budget. Empty DATA frames are limited
+    /// separately and do not consume this budget.
+    ///
+    /// When this budget is exhausted, the connection is closed with
+    /// `ENHANCE_YOUR_CALM`.
+    ///
+    /// By default, the budget is half the target connection window, with a
+    /// minimum of 25,600 bytes. Changing the target window at runtime also
+    /// updates the permitted framing overhead.
+    pub fn data_frame_budget(&mut self, budget: usize) -> &mut Self {
+        self.data_frame_budget = proto::DataFrameBudget::Configured(budget);
         self
+    }
+
+    /// Sets the ID of the first request stream, which defaults to 1.
+    ///
+    /// Requests never use a lower ID, so [`Builder::priorities`] can declare
+    /// lower streams as dependency parents without a later request opening them.
+    ///
+    /// Clients open odd, 31-bit stream IDs ([RFC 9113 §5.1.1]), so an even
+    /// `stream_id` is rounded up to the next odd one, and one above
+    /// 2<sup>31</sup> - 1 is treated as 2<sup>31</sup> - 1, which leaves room
+    /// for a single request.
+    ///
+    /// [RFC 9113 §5.1.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.1
+    pub fn initial_stream_id(&mut self, stream_id: u32) -> &mut Self {
+        self.stream_id = StreamId::saturating_client(stream_id);
+        self
+    }
+
+    /// Returns the precise initial SETTINGS frame this client builder will send.
+    pub fn local_initial_settings(&self) -> &Settings {
+        &self.settings
     }
 
     /// Sets the order of settings parameters in the initial SETTINGS frame.
     ///
     /// This determines the order in which settings are sent during the HTTP/2 handshake.
-    /// Customizing the order may be useful for testing or protocol compliance.
+    /// Customizing the order may be useful for interoperability or testing purposes.
     pub fn settings_order(&mut self, order: SettingsOrder) -> &mut Self {
         self.settings.set_settings_order(order);
         self
-    }
-
-    /// Returns the initial SETTINGS frame this builder will send during the
-    /// HTTP/2 handshake.
-    #[inline]
-    pub fn local_initial_settings(&self) -> &Settings {
-        &self.settings
     }
 
     /// Sets the HTTP/2 pseudo-header field order for outgoing HEADERS frames.
@@ -1243,29 +1386,40 @@ impl Builder {
     /// are encoded in the HEADERS frame. Customizing the order may be useful for interoperability
     /// or testing purposes.
     pub fn headers_pseudo_order(&mut self, order: PseudoOrder) -> &mut Self {
-        self.headers_pseudo_order = Some(order.into());
+        self.headers_pseudo_order = Some(order);
         self
     }
 
-    /// Sets the stream dependency and weight for the outgoing HEADERS frame.
+    /// Sets the default priority fields of outgoing request `HEADERS` frames.
     ///
-    /// This configures the priority of the stream by specifying its dependency and weight,
-    /// as defined by the HTTP/2 priority mechanism. This can be used to influence how the
-    /// server allocates resources to this stream relative to others.
-    pub fn headers_stream_dependency(&mut self, stream_dependency: StreamDependency) -> &mut Self {
-        self.headers_stream_dependency = Some(stream_dependency);
+    /// A request carrying its own [`HeadersPriority`] extension replaces this
+    /// default. The handshake fails if a
+    /// [`HeadersDependency::Declared`](crate::ext::HeadersDependency::Declared) parent
+    /// is missing from [`Builder::priorities`] or could be a later request's
+    /// own stream.
+    ///
+    /// These priority fields are deprecated by [RFC 9113 §5.3.2].
+    ///
+    /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
+    pub fn headers_priority(&mut self, priority: HeadersPriority) -> &mut Self {
+        self.headers_priority = Some(priority);
         self
     }
 
-    /// Sets the list of PRIORITY frames to be sent immediately after the connection is established,
-    /// but before the first request is sent.
+    /// Sets the list of PRIORITY frames appended once to the initial client
+    /// connection item after SETTINGS and the optional WINDOW_UPDATE.
     ///
     /// This allows you to pre-configure the HTTP/2 stream dependency tree by specifying a set of
-    /// PRIORITY frames that will be sent as part of the connection preface. This can be useful for
-    /// optimizing resource allocation or testing custom stream prioritization strategies.
+    /// PRIORITY frames that will be sent independently of the request queue. This can be useful
+    /// for pre-configuring dependency nodes without replaying them for every request.
     ///
-    /// Each `Priority` in the list must have a valid (non-zero) stream ID. Any priority with a
-    /// stream ID of zero will be ignored.
+    /// Each [`Priority`] in the list must have a valid (non-zero) stream ID. Any priority with a
+    /// stream ID of zero or a dependency on the same stream will be ignored.
+    /// PRIORITY does not reserve stream IDs. Profiles that start requests later
+    /// can configure [`Builder::initial_stream_id`].
+    /// If `no_rfc7540_priorities(true)` is also configured, a conforming server
+    /// ignores these legacy priority signals as required by
+    /// [RFC 9218 section 2.1](https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1).
     pub fn priorities(&mut self, priorities: Priorities) -> &mut Self {
         self.priorities = Some(priorities);
         self
@@ -1274,14 +1428,34 @@ impl Builder {
     /// Creates a new configured HTTP/2 client backed by `io`.
     ///
     /// It is expected that `io` already be in an appropriate state to commence
-    /// the [HTTP/2 handshake]. The handshake is completed once both the connection
-    /// preface and the initial settings frame is sent by the client.
+    /// the [HTTP/2 handshake]. This future prepares the client connection
+    /// preface and initial settings frame. They are written once the returned
+    /// [`Connection`] is polled.
     ///
     /// The handshake future does not wait for the initial settings frame from the
     /// server.
     ///
+    /// This future performs no transport I/O. Transport errors while writing
+    /// the client preface or initial SETTINGS are reported when the returned
+    /// [`Connection`] is polled.
+    ///
+    /// The initial connection item contains the client magic, SETTINGS, an
+    /// optional connection WINDOW_UPDATE, and any configured PRIORITY frames.
+    /// Request frames stay in the normal stream queue until that item completes.
+    /// If a request can be opened immediately and is queued through
+    /// [`SendRequest`] before polling [`Connection`], the same poll can continue
+    /// with a separate write for its HEADERS and other ready stream frames. No
+    /// flush is inserted between those write items.
+    ///
+    /// A partial write resumes from the same item before the next queue is
+    /// advanced. A request held by the initial stream concurrency limit remains
+    /// pending. Polling the connection without a request still sends the
+    /// available connection frames immediately. Once request scheduling starts,
+    /// other ready frames may follow the first HEADERS; the scheduler is not
+    /// artificially cut off after one request.
+    ///
     /// Returns a future which resolves to the [`Connection`] / [`SendRequest`]
-    /// tuple once the HTTP/2 handshake has been completed.
+    /// tuple once the HTTP/2 handshake state has been prepared.
     ///
     /// This function also allows the caller to configure the send payload data
     /// type. See [Outbound data type] for more details.
@@ -1303,8 +1477,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     ///     -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .handshake(my_io);
     /// # client_fut.await
@@ -1323,8 +1496,7 @@ impl Builder {
     /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
     /// # -> Result<((SendRequest<&'static [u8]>, Connection<T, &'static [u8]>)), http2::Error>
     /// # {
-    /// // `client_fut` is a future representing the completion of the HTTP/2
-    /// // handshake.
+    /// // `client_fut` prepares the client-side HTTP/2 state.
     /// let client_fut = Builder::new()
     ///     .handshake::<_, &'static [u8]>(my_io);
     /// # client_fut.await
@@ -1335,12 +1507,79 @@ impl Builder {
     pub fn handshake<T, B>(
         &self,
         io: T,
-    ) -> impl Future<Output = Result<(SendRequest<B>, Connection<T, B>), crate::Error>>
+    ) -> impl Future<Output = Result<(SendRequest<B>, Connection<T, B>), crate::Error>> + use<T, B>
     where
         T: AsyncRead + AsyncWrite + Unpin,
         B: Buf,
     {
         Connection::handshake2(io, self.clone())
+    }
+
+    /// Sets the initial receive window target for each locally initiated stream.
+    ///
+    /// Targets above the `SETTINGS_INITIAL_WINDOW_SIZE` advertised by
+    /// [`initial_window_size`] add one stream `WINDOW_UPDATE` immediately after
+    /// the complete request header block. Lower or equal targets do not shrink
+    /// the window or send an update; leaving this unset preserves normal behavior.
+    ///
+    /// Targets above 2<sup>31</sup> - 1 fail [`handshake`] before transport I/O.
+    /// See [RFC 9113 section 6.9] for flow-control requirements.
+    ///
+    /// [`initial_window_size`]: Self::initial_window_size
+    /// [`handshake`]: Self::handshake
+    /// [RFC 9113 section 6.9]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use bytes::Bytes;
+    /// # use http2::client::*;
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), http2::Error>
+    /// # {
+    /// let client_fut = Builder::new()
+    ///     .initial_window_size(131_072)
+    ///     .initial_stream_window_size(12 * 1024 * 1024)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// ```
+    pub fn initial_stream_window_size(&mut self, target: u32) -> &mut Self {
+        self.initial_target_stream_window_size = Some(target);
+        self
+    }
+
+    /// Sends a PING with the next HEADERS or non-empty DATA frame once nothing
+    /// has been read for longer than `threshold`.
+    ///
+    /// The PING follows HEADERS but precedes DATA, and its payload is a
+    /// big-endian counter starting at 1. It is skipped while the previous one
+    /// or a user PING awaits an ACK, and user PINGs are held back until it is
+    /// acknowledged. An ACK with any payload acknowledges it, and a missing
+    /// ACK closes the connection only with
+    /// [`preface_ping_timeout`](Self::preface_ping_timeout).
+    ///
+    /// See [RFC 9113 section 6.7](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.7).
+    pub fn preface_ping(&mut self, threshold: Duration) -> &mut Self {
+        self.preface_ping = Some(threshold);
+        self
+    }
+
+    /// Closes the connection once a preface PING is unanswered and nothing has
+    /// been read for `timeout`, counted from when the PING is queued or the
+    /// last read, whichever is later.
+    ///
+    /// The connection then sends GOAWAY with `PROTOCOL_ERROR` and the debug
+    /// data `Failed ping.` and fails its streams. If a GOAWAY, this one
+    /// included, cannot be written by then, it ends without it and keeps its
+    /// reason, unless the GOAWAY comes from [`Connection::abrupt_shutdown`]
+    /// while open. The connection has no timer, so poll it at
+    /// [`Connection::preface_ping_deadline`]. Without
+    /// [`preface_ping`](Self::preface_ping) this does nothing.
+    pub fn preface_ping_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.preface_ping_timeout = Some(timeout);
+        self
     }
 }
 
@@ -1357,7 +1596,7 @@ impl Default for Builder {
 /// the [HTTP/2 handshake]. See [Handshake] for more details.
 ///
 /// Returns a future which resolves to the [`Connection`] / [`SendRequest`]
-/// tuple once the HTTP/2 handshake has been completed. The returned
+/// tuple once the HTTP/2 handshake state has been prepared. The returned
 /// [`Connection`] instance will be using default configuration values. Use
 /// [`Builder`] to customize the configuration values used by a [`Connection`]
 /// instance.
@@ -1377,9 +1616,8 @@ impl Default for Builder {
 /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T) -> Result<(), http2::Error>
 /// # {
 /// let (send_request, connection) = client::handshake(my_io).await?;
-/// // The HTTP/2 handshake has completed, now start polling
-/// // `connection` and use `send_request` to send requests to the
-/// // server.
+/// // Queueing a request before polling `connection` lets the driver continue
+/// // with its HEADERS immediately after the separate initial connection write.
 /// # Ok(())
 /// # }
 /// #
@@ -1403,36 +1641,64 @@ where
 
 // ===== impl Connection =====
 
-async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    tracing::debug!("binding client connection");
-
-    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
-
-    tracing::debug!("client connection bound");
-
-    Ok(())
-}
-
 impl<T, B> Connection<T, B>
 where
     T: AsyncRead + AsyncWrite + Unpin,
     B: Buf,
 {
     async fn handshake2(
-        mut io: T,
+        io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
-        bind_connection(&mut io).await?;
+        tracing::debug!("preparing client connection preface");
 
-        // Create the codec
+        let initial_stream_window = builder
+            .initial_target_stream_window_size
+            .map(|target| {
+                let advertised = builder
+                    .settings
+                    .initial_window_size()
+                    .unwrap_or(crate::frame::DEFAULT_INITIAL_WINDOW_SIZE);
+
+                if target > proto::MAX_WINDOW_SIZE {
+                    return Err(UserError::InvalidInitialStreamWindowSize);
+                }
+
+                Ok((target, advertised))
+            })
+            .transpose()?;
+
+        let headers_priority_policy = proto::HeadersPriorityPolicy::new(
+            builder.headers_priority,
+            builder.priorities.as_ref(),
+            builder.stream_id,
+        )?;
+
+        // RFC 9113 section 3.4 requires the client magic to be followed by
+        // SETTINGS. Both are prepared without I/O; the connection driver writes
+        // this item before it advances the separate request frame queue.
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
         let mut codec = Codec::new(io);
+        codec.buffer_client_magic(CLIENT_MAGIC);
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
+        }
+
+        if let Some(max) = builder.max_send_data_frame_size {
+            codec.set_max_send_data_frame_size(max as usize);
+        }
+
+        if let Some(max) = builder.max_send_header_frame_size {
+            codec.set_max_send_header_frame_size(max as usize);
+        }
+
+        if builder.one_frame_per_write {
+            codec.set_one_frame_per_write();
+        }
+
+        if let Some(max) = builder.max_write_buffer_size {
+            codec.set_max_write_buffer_size(max);
         }
 
         if let Some(max) = builder.settings.max_header_list_size() {
@@ -1444,6 +1710,8 @@ where
             .buffer((builder.settings.clone()).into())
             .expect("invalid SETTINGS frame");
 
+        tracing::debug!("client connection preface and initial settings buffered");
+
         let inner = proto::Connection::new(
             codec,
             proto::Config {
@@ -1454,10 +1722,13 @@ where
                 reset_stream_max: builder.reset_stream_max,
                 remote_reset_stream_max: builder.pending_accept_reset_stream_max,
                 local_error_reset_streams_max: builder.local_max_error_reset_streams,
-                headers_pseudo_order: builder.headers_pseudo_order,
-                headers_stream_dependency: builder.headers_stream_dependency,
-                priorities: builder.priorities,
                 settings: builder.settings,
+                data_frame_budget: builder.data_frame_budget,
+                headers_pseudo_order: builder.headers_pseudo_order,
+                headers_priority_policy,
+                priorities: builder.priorities,
+                preface_ping: builder.preface_ping,
+                preface_ping_timeout: builder.preface_ping_timeout,
             },
         );
         let send_request = SendRequest {
@@ -1466,6 +1737,9 @@ where
         };
 
         let mut connection = Connection { inner };
+        if let Some((target, advertised)) = initial_stream_window {
+            connection.set_initial_stream_window_size(target, advertised);
+        }
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
         }
@@ -1484,15 +1758,18 @@ where
     /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
     /// out until the number of "in flight" bytes drops below `size`.
     ///
-    /// The default value is 65,535.
+    /// The default value is 65,535. The automatic small-DATA-frame budget is
+    /// updated to match this target. A `size` above 2<sup>31</sup> - 1, the
+    /// largest window [RFC 9113 §6.9.1] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// See [`FlowControl`] documentation for more details.
     ///
     /// [`FlowControl`]: ../struct.FlowControl.html
     /// [library level]: ../index.html#flow-control
+    /// [RFC 9113 §6.9.1]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
     pub fn set_target_window_size(&mut self, size: u32) {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.inner.set_target_window_size(size);
+        self.inner
+            .set_target_window_size(size.min(proto::MAX_WINDOW_SIZE));
     }
 
     /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
@@ -1502,15 +1779,21 @@ where
     /// remote acknowledges the change.
     ///
     /// This can be used to increase or decrease the window size for existing
-    /// streams.
+    /// streams. A `size` above 2<sup>31</sup> - 1, the largest window
+    /// [RFC 9113 §6.5.2] allows, is treated as 2<sup>31</sup> - 1.
     ///
     /// # Errors
     ///
     /// Returns an error if a previous call is still pending acknowledgement
-    /// from the remote endpoint.
+    /// from the remote endpoint. When [`Builder::initial_stream_window_size`]
+    /// is configured, dynamically increasing the stream baseline is also
+    /// rejected because it could overflow an already-open stream's target
+    /// window before the acknowledgement arrives.
+    ///
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
-        assert!(size <= proto::MAX_WINDOW_SIZE);
-        self.inner.set_initial_window_size(size)?;
+        self.inner
+            .set_client_initial_window_size(size.min(proto::MAX_WINDOW_SIZE))?;
         Ok(())
     }
 
@@ -1523,12 +1806,54 @@ where
         self.inner.take_user_pings().map(PingPong::new)
     }
 
+    /// Returns whether any bytes were read from the server since the last call.
+    ///
+    /// Bytes of frames the connection ignores or has not fully received also
+    /// count, so this measures read idleness for keep-alive logic.
+    pub fn take_read_activity(&mut self) -> bool {
+        self.inner.take_read_activity()
+    }
+
+    /// Returns whether any stream is open or waiting to open.
+    ///
+    /// A request counts from [`SendRequest::send_request`] until its stream
+    /// closes, including while `SETTINGS_MAX_CONCURRENT_STREAMS` holds it back.
+    /// A request reset before it opens stops counting, though it may count
+    /// again while its HEADERS and RST_STREAM are written.
+    ///
+    /// Read it once polling the connection returns `Pending`. A request sent
+    /// during that poll may open without waking the task again, while one sent
+    /// later wakes it.
+    pub fn has_streams(&self) -> bool {
+        self.inner.streams().has_streams_or_pending_open()
+    }
+
+    /// Returns when the unanswered preface PING times out, unless a GOAWAY from
+    /// [`abrupt_shutdown`](Self::abrupt_shutdown) while open waits to be written.
+    ///
+    /// Any bytes read, even ones dropped while closing, move it later, so read
+    /// it again after each poll. A paused runtime clock does not advance it.
+    pub fn preface_ping_deadline(&self) -> Option<Instant> {
+        self.inner.preface_ping_deadline()
+    }
+
+    /// Sets the connection to a GOAWAY state.
+    ///
+    /// Does not terminate the connection. Must continue being polled to close
+    /// connection.
+    ///
+    /// After flushing the GOAWAY frame, the connection is closed. Any
+    /// outstanding streams do not prevent the connection from closing.
+    pub fn abrupt_shutdown(&mut self, reason: Reason) {
+        self.inner.go_away_from_user(reason);
+    }
+
     /// Returns the maximum number of concurrent streams that may be initiated
     /// by this client.
     ///
     /// This limit is configured by the server peer by sending the
     /// [`SETTINGS_MAX_CONCURRENT_STREAMS` parameter][1] in a `SETTINGS` frame.
-    /// This method returns the currently acknowledged value received from the
+    /// This method returns the latest value received from the
     /// remote.
     ///
     /// [1]: https://tools.ietf.org/html/rfc7540#section-5.1.2
@@ -1550,20 +1875,37 @@ where
         self.inner.max_recv_streams()
     }
 
-    /// Returns the initial SETTINGS frame received from the remote peer, if available.
+    /// Returns the peer initial SETTINGS frame, if one was received.
     pub fn remote_initial_settings(&self) -> Option<Settings> {
         self.inner.streams().remote_initial_settings()
     }
 
-    /// Returns the first connection-level WINDOW_UPDATE and whether it arrived
-    /// before the peer acknowledged our initial SETTINGS frame.
+    /// Returns the first connection WINDOW_UPDATE increment and its order relative to SETTINGS ACK.
     pub fn remote_first_connection_window_update(&self) -> Option<(u32, bool)> {
         self.inner.streams().remote_first_connection_window_update()
     }
 
-    /// Returns whether the peer acknowledged our initial SETTINGS frame.
+    /// Returns whether the peer has acknowledged our initial SETTINGS frame.
     pub fn remote_initial_settings_ack_received(&self) -> bool {
         self.inner.streams().remote_initial_settings_ack_received()
+    }
+
+    fn set_initial_stream_window_size(&mut self, target: u32, advertised: u32) {
+        self.inner
+            .set_initial_stream_window_size(target, advertised);
+    }
+
+    /// Returns whether the server enabled the [extended CONNECT protocol][1].
+    ///
+    /// Returns `None` until the server's initial SETTINGS frame is applied. The value
+    /// is read from this connection without locking, so the task driving it can
+    /// publish changes. Clients must not send extended CONNECT before this returns
+    /// `Some(true)` ([RFC 8441 §3][2]).
+    ///
+    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+    pub fn extended_connect_protocol(&self) -> Option<bool> {
+        self.inner.remote_extended_connect()
     }
 }
 
@@ -1575,8 +1917,12 @@ where
     type Output = Result<(), crate::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.maybe_close_connection_if_no_streams();
+        // Snapshot before checking for shutdown: the last reference may be
+        // dropped after the shutdown check, before inner.poll registers a
+        // waker. A snapshot taken after that drop would be false and skip the
+        // self-wake below, leaving the connection pending without closing.
         let had_streams_or_refs = self.inner.has_streams_or_other_references();
+        self.inner.maybe_close_connection_if_no_streams();
         let result = self.inner.poll(cx).map_err(Into::into);
         // if we had streams/refs, and don't anymore, wake up one more time to
         // ensure proper shutdown
@@ -1622,7 +1968,7 @@ impl ResponseFuture {
     ///
     /// If the lock on the stream store has been poisoned.
     pub fn stream_id(&self) -> crate::StreamId {
-        crate::StreamId::from_internal(self.inner.stream_id())
+        self.inner.stream_id().into()
     }
 
     /// Polls for informational responses (1xx status codes).
@@ -1746,7 +2092,7 @@ impl Peer {
         protocol: Option<Protocol>,
         end_of_stream: bool,
         pseudo_order: Option<PseudoOrder>,
-        headers_stream_dependency: Option<StreamDependency>,
+        stream_dependency: Option<StreamDependency>,
     ) -> Result<Headers, SendError> {
         use http::request::Parts;
 
@@ -1802,7 +2148,7 @@ impl Peer {
 
         // Create the HEADERS frame
         let mut headers_frame = Headers::new(id, pseudo, headers);
-        if let Some(stream_dep) = headers_stream_dependency {
+        if let Some(stream_dep) = stream_dependency {
             headers_frame.set_stream_dependency(stream_dep);
         }
 
@@ -1841,6 +2187,11 @@ impl proto::Peer for Peer {
 
         if let Some(status) = pseudo.status {
             b = b.status(status);
+        } else {
+            // Every response must include :status (RFC 9113, section 8.3.2).
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3.2
+            proto_err!(stream: "missing :status; stream={:?}", stream_id);
+            return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
         }
 
         let mut response = match b.body(()) {

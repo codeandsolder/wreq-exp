@@ -55,8 +55,8 @@ pub use self::go_away::GoAway;
 pub use self::head::{Head, Kind};
 #[allow(unused_imports)]
 pub use self::headers::{
-    parse_u64, Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PseudoOrderBuilder,
-    PushPromise, PushPromiseHeaderError,
+    Continuation, Headers, Pseudo, PseudoId, PseudoOrder, PseudoOrderBuilder, PushPromise,
+    PushPromiseHeaderError, parse_u64,
 };
 pub use self::ping::Ping;
 #[allow(unused_imports)]
@@ -66,9 +66,7 @@ pub use self::reset::Reset;
 #[cfg(feature = "unstable")]
 pub use self::settings::{ExperimentalSettings, ExperimentalSettingsBuilder};
 #[allow(unused_imports)]
-pub use self::settings::{
-    ObservedSetting, Setting, SettingId, Settings, SettingsOrder, SettingsOrderBuilder,
-};
+pub use self::settings::{ObservedSetting, Setting, SettingId, Settings, SettingsOrder, SettingsOrderBuilder};
 pub use self::stream_id::{StreamId, StreamIdOverflow};
 pub use self::window_update::WindowUpdate;
 
@@ -163,8 +161,8 @@ pub enum Error {
 
     /// An invalid stream identifier was provided.
     ///
-    /// This is returned if a SETTINGS or PING frame is received with a stream
-    /// identifier other than zero.
+    /// This is returned if a SETTINGS, PING or GOAWAY frame is received with a
+    /// stream identifier other than zero.
     InvalidStreamId,
 
     /// A request or response is malformed.

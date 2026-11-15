@@ -9,19 +9,22 @@ use http::{HeaderMap, Request, Response};
 use tokio::io::AsyncWrite;
 
 use super::{
-    frame::{Priorities, PseudoOrder, StreamDependency},
+    Buffer, BufferStatus, ChainLink, Config, Counts, HeadersPriorityPolicy, Prioritized, Recv,
+    Send, Stream, StreamId,
+    frame::PseudoOrder,
+    headers_priority,
     recv::RecvHeaderBlockError,
     store::{self, Entry, Resolve, Store},
     sync::Mutex,
-    Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId,
 };
+use crate::ext::HeadersPriority;
 use crate::{
     client,
     codec::{Codec, SendError, UserError},
     ext::Protocol,
     frame::{self, Frame, Reason},
     proto,
-    proto::{peer, Error, Initiator, Open, Peer, WindowSize},
+    proto::{Error, Initiator, Open, Peer, PrefacePing, WindowSize, peer},
     server, tracing,
 };
 
@@ -58,6 +61,16 @@ pub(crate) struct DynStreams<'a, B> {
     peer: peer::Dyn,
 }
 
+/// Outcome of receiving a frame that can open a stream.
+#[derive(Debug)]
+#[must_use = "a refused stream must be reset by the connection"]
+pub(crate) enum RecvOutcome {
+    /// The frame was handled, including any intentional ignoring of it.
+    Processed,
+    /// The connection must send REFUSED_STREAM for this stream ID.
+    Refused(StreamId),
+}
+
 /// Reference to the stream state
 #[derive(Debug)]
 pub(crate) struct StreamRef<B> {
@@ -89,23 +102,13 @@ struct Inner {
     /// The number of stream refs to this shared state.
     refs: usize,
 
-    /// Headers stream dependency
-    headers_stream_dependency: Option<StreamDependency>,
+    /// Connection-level request `HEADERS` priority rules
+    headers_priority_policy: HeadersPriorityPolicy,
 
     /// Pseudo order of the headers stream
     headers_pseudo_order: Option<PseudoOrder>,
-
-    /// Priority of the headers stream
-    priorities: Option<Priorities>,
-
-    /// Initial SETTINGS frame received from the remote peer.
     remote_initial_settings: Option<frame::Settings>,
-
-    /// First connection-level WINDOW_UPDATE received from the remote peer,
-    /// paired with whether it arrived before the peer acknowledged our initial SETTINGS.
     remote_first_connection_window_update: Option<(u32, bool)>,
-
-    /// Whether the remote peer acknowledged our initial SETTINGS frame.
     remote_initial_settings_ack_received: bool,
 }
 
@@ -154,7 +157,29 @@ where
 
         me.actions
             .recv
-            .set_target_connection_window(size, &mut me.actions.task)
+            .set_target_connection_window(size, &mut me.actions.task)?;
+        me.counts.set_target_connection_window_size(size);
+        Ok(())
+    }
+
+    /// Adds the connection-level WINDOW_UPDATE to the client's initial write.
+    ///
+    /// Stream-level updates and request frames stay in their normal queues and
+    /// are not moved into the codec until this write has completed.
+    pub(crate) fn buffer_client_initial_window_update<T>(
+        &mut self,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        let mut me = self.inner.lock();
+        match me.actions.recv.send_connection_window_update(dst)? {
+            BufferStatus::Complete => Ok(()),
+            BufferStatus::CodecFull => Err(io::Error::other(
+                "client initial write buffer has insufficient capacity",
+            )),
+        }
     }
 
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
@@ -183,17 +208,17 @@ where
         })
     }
 
-    pub fn send_pending_refusal<T>(
-        &mut self,
-        cx: &mut Context,
-        dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
-    where
-        T: AsyncWrite + Unpin,
-    {
+    /// Count a refused stream toward the local error reset limit.
+    pub fn count_pending_refusal(&mut self) -> Result<(), Error> {
         let mut me = self.inner.lock();
-        let me = &mut *me;
-        me.actions.recv.send_pending_refusal(cx, dst)
+        if !me.counts.can_inc_num_local_error_resets() {
+            return Err(Error::library_go_away_data(
+                Reason::ENHANCE_YOUR_CALM,
+                "too_many_internal_resets",
+            ));
+        }
+        me.counts.inc_num_local_error_resets();
+        Ok(())
     }
 
     pub fn clear_expired_reset_streams(&mut self) {
@@ -208,12 +233,54 @@ where
         &mut self,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
+        mut preface_ping: Option<&mut PrefacePing>,
     ) -> Poll<io::Result<()>>
     where
         T: AsyncWrite + Unpin,
     {
-        let mut me = self.inner.lock();
-        me.poll_complete(&self.send_buffer, cx, dst)
+        loop {
+            // Make any required socket progress before taking stream locks.
+            ready!(dst.poll_ready(cx))?;
+
+            let status = {
+                let mut me = self.inner.lock();
+                let status =
+                    me.buffer_pending(&self.send_buffer, dst, preface_ping.as_deref_mut())?;
+
+                // Register the task while holding the same lock used to
+                // observe that all pending frames have been buffered. A
+                // producer that queues another frame while the codec is being
+                // flushed will then take and wake this task.
+                if status == BufferStatus::Complete {
+                    me.actions.task = Some(cx.waker().clone());
+                }
+
+                status
+            };
+
+            match status {
+                BufferStatus::Complete => {}
+                // `poll_ready` only flushes a full codec, but room may also be
+                // reserved for a preface PING.
+                BufferStatus::CodecFull => {
+                    ready!(dst.flush(cx))?;
+                    continue;
+                }
+            }
+
+            // Flush any frames staged by `buffer_pending` without holding the
+            // stream-state or send-buffer mutexes.
+            ready!(dst.flush(cx))?;
+
+            let reclaimed = {
+                let mut me = self.inner.lock();
+                me.reclaim_written_frame(&self.send_buffer, dst)
+            };
+
+            if !reclaimed {
+                return Poll::Ready(Ok(()));
+            }
+        }
     }
 
     pub fn apply_remote_settings(
@@ -223,7 +290,6 @@ where
     ) -> Result<(), Error> {
         let mut me = self.inner.lock();
         let me = &mut *me;
-
         if is_initial {
             me.remote_initial_settings = Some(frame.clone());
         }
@@ -276,6 +342,7 @@ where
         use super::stream::ContentLength;
 
         let protocol = request.extensions_mut().remove::<Protocol>();
+        let request_priority = request.extensions_mut().remove::<HeadersPriority>();
 
         // Clear before taking lock, incase extensions contain a StreamRef.
         request.extensions_mut().clear();
@@ -292,7 +359,7 @@ where
         let send_buffer = &mut *send_buffer;
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.ensure_next_stream_id()?;
+        let next_stream_id = me.actions.send.ensure_next_stream_id()?;
 
         // The `pending` argument is provided by the `Client`, and holds
         // a store `Key` of a `Stream` that may have been not been opened
@@ -300,10 +367,10 @@ where
         //
         // If that stream is still pending, the Client isn't allowed to
         // queue up another pending stream. They should use `poll_ready`.
-        if let Some(stream) = pending {
-            if me.store.resolve(stream.key).is_pending_open {
-                return Err(UserError::Rejected.into());
-            }
+        if let Some(stream) = pending
+            && me.store.resolve(stream.key).is_pending_open
+        {
+            return Err(UserError::Rejected.into());
         }
 
         if me.counts.peer().is_server() {
@@ -311,6 +378,9 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
+        let priority = me
+            .headers_priority_policy
+            .resolve(request_priority, next_stream_id)?;
         let stream_id = me.actions.send.open()?;
 
         let mut stream = Stream::new(
@@ -318,21 +388,14 @@ where
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
+        // A `Chain` parent depends on which streams are still open when the
+        // initial HEADERS is written, which can be later for queued requests.
+        stream.chain_link = priority.and_then(ChainLink::pending);
 
-        if *request.method() == Method::HEAD {
-            stream.content_length = ContentLength::Head;
-        }
-
-        // Priorities frame check before sending the request.
-        if let Some(priorities) = &me.priorities {
-            let next_id = priorities
-                .max_stream_id()
-                .next_id()
-                .map_err(|_| SendError::User(UserError::OverflowedStreamId))?;
-
-            if next_id > stream_id {
-                return Err(SendError::User(UserError::OverflowedStreamId));
-            }
+        match *request.method() {
+            Method::HEAD => stream.content_length = ContentLength::Head,
+            Method::CONNECT => stream.content_length = ContentLength::Connect,
+            _ => {}
         }
 
         // Convert the message
@@ -342,13 +405,14 @@ where
             protocol,
             end_of_stream,
             me.headers_pseudo_order.clone(),
-            me.headers_stream_dependency,
+            priority.and_then(headers_priority::fixed_dependency),
         )?;
+
+        me.actions.recv.init_request_window(&mut stream);
 
         let mut stream = me.store.insert(stream.id, stream);
 
-        let sent = me.actions.send.send_priority_and_headers(
-            me.priorities.clone(),
+        let sent = me.actions.send.send_headers(
             headers,
             send_buffer,
             &mut stream,
@@ -410,7 +474,8 @@ impl<B> DynStreams<'_, B> {
         self.peer.is_server()
     }
 
-    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
+    /// Reports whether the connection must refuse the stream opened by the peer.
+    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<RecvOutcome, Error> {
         let mut me = self.inner.lock();
 
         me.recv_headers(self.peer, self.send_buffer, frame)
@@ -447,7 +512,8 @@ impl<B> DynStreams<'_, B> {
         me.recv_window_update(self.send_buffer, frame)
     }
 
-    pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
+    /// Reports whether the connection must refuse the promised stream.
+    pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<RecvOutcome, Error> {
         let mut me = self.inner.lock();
         me.recv_push_promise(self.send_buffer, frame)
     }
@@ -484,9 +550,8 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
-            headers_stream_dependency: config.headers_stream_dependency,
+            headers_priority_policy: config.headers_priority_policy,
             headers_pseudo_order: config.headers_pseudo_order,
-            priorities: config.priorities,
             remote_initial_settings: None,
             remote_first_connection_window_update: None,
             remote_initial_settings_ack_received: false,
@@ -498,7 +563,7 @@ impl Inner {
         peer: peer::Dyn,
         send_buffer: &SendBuffer<B>,
         frame: frame::Headers,
-    ) -> Result<(), Error> {
+    ) -> Result<RecvOutcome, Error> {
         let id = frame.stream_id();
 
         // The GOAWAY process has begun. All streams with a greater ID than
@@ -509,7 +574,7 @@ impl Inner {
                 id,
                 self.actions.recv.max_stream_id()
             );
-            return Ok(());
+            return Ok(RecvOutcome::Processed);
         }
 
         let key = match self.store.find_entry(id) {
@@ -546,7 +611,7 @@ impl Inner {
 
                         e.insert(stream)
                     }
-                    None => return Ok(()),
+                    None => return Ok(RecvOutcome::Refused(id)),
                 }
             }
         };
@@ -563,15 +628,13 @@ impl Inner {
             // This is because the remote may have sent trailers before
             // receiving the RST_STREAM frame.
             tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.id);
-            return Ok(());
+            return Ok(RecvOutcome::Processed);
         }
 
         let actions = &mut self.actions;
-        let mut send_buffer = send_buffer.inner.lock();
-        let send_buffer = &mut *send_buffer;
 
         self.counts.transition(stream, |counts, stream| {
-           tracing::trace!(
+            tracing::trace!(
                 "recv_headers; stream={:?}; state={:?}",
                 stream.id,
                 stream.state
@@ -580,17 +643,32 @@ impl Inner {
             let res = if stream.state.is_recv_headers() {
                 match actions.recv.recv_headers(frame, stream, counts) {
                     Ok(()) => Ok(()),
-                    Err(RecvHeaderBlockError::Oversize(resp)) => {
-                        if let Some(resp) = resp {
+                    Err(RecvHeaderBlockError::Oversize) => {
+                        if peer.is_server() {
+                            let mut resp = frame::Headers::new(
+                                stream.id,
+                                frame::Pseudo::response(
+                                    ::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                                ),
+                                HeaderMap::new(),
+                            );
+                            resp.set_end_stream();
+                            let mut send_buffer = send_buffer.inner.lock();
                             let sent = actions.send.send_headers(
-                                resp, send_buffer, stream, counts, &mut actions.task);
+                                resp,
+                                &mut send_buffer,
+                                stream,
+                                counts,
+                                &mut actions.task,
+                            );
                             debug_assert!(sent.is_ok(), "oversize response should not fail");
 
                             actions.send.schedule_implicit_reset(
                                 stream,
                                 Reason::PROTOCOL_ERROR,
                                 counts,
-                                &mut actions.task);
+                                &mut actions.task,
+                            );
 
                             actions.recv.enqueue_reset_expiration(stream, counts);
 
@@ -612,8 +690,10 @@ impl Inner {
                 actions.recv.recv_trailers(frame, stream)
             };
 
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
-        })
+            actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
+        })?;
+
+        Ok(RecvOutcome::Processed)
     }
 
     fn recv_data<B>(
@@ -664,12 +744,30 @@ impl Inner {
         };
 
         let actions = &mut self.actions;
-        let mut send_buffer = send_buffer.inner.lock();
-        let send_buffer = &mut *send_buffer;
 
         self.counts.transition(stream, |counts, stream| {
             let sz = frame.flow_controlled_len();
-            let res = actions.recv.recv_data(frame, stream);
+            let is_end_stream = frame.is_end_stream();
+            let payload_len = frame.payload().len();
+            // Only DATA retained for the application contributes to the
+            // buffering budget. Empty frames keep their separate consecutive
+            // limit even when the stream is no longer receiving.
+            let should_record_data_frame =
+                payload_len == 0 || (stream.is_recv && !stream.state.is_local_error());
+            let mut res = actions.recv.recv_data(frame, stream);
+            // A stream can receive at most one final DATA frame, so it cannot
+            // be used to create unbounded framing overhead on that stream.
+            if res.is_ok() && !is_end_stream && should_record_data_frame {
+                res = counts.record_data_frame(payload_len).map_err(|_| {
+                    tracing::debug!("too many small DATA frames");
+                    Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM, "too_many_data_frames")
+                });
+            }
+            // Any accepted payload ends a run of empty frames, including
+            // payload still in flight after the stream was reset or released.
+            if res.is_ok() && payload_len != 0 {
+                counts.reset_empty_data_frames();
+            }
 
             // Any stream error after receiving a DATA frame means
             // we won't give the data to the user, and so they can't
@@ -679,7 +777,7 @@ impl Inner {
                     .recv
                     .release_connection_capacity(sz as WindowSize, &mut None);
             }
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            actions.reset_on_recv_stream_err_deferred(send_buffer, stream, counts, res)
         })
     }
 
@@ -766,24 +864,23 @@ impl Inner {
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
 
-                let res = self
-                    .actions
-                    .send
-                    .recv_stream_window_update(
-                        frame.size_increment(),
-                        send_buffer,
-                        &mut stream,
-                        &mut self.counts,
-                        &mut self.actions.task,
-                    )
-                    .map_err(|reason| Error::library_reset(id, reason));
-
-                return self.actions.reset_on_recv_stream_err(
+                let Err(reason) = self.actions.send.recv_stream_window_update(
+                    frame.size_increment(),
                     send_buffer,
                     &mut stream,
                     &mut self.counts,
-                    res,
-                );
+                    &mut self.actions.task,
+                ) else {
+                    return Ok(());
+                };
+
+                // A flow-control reset closes the stream, so run the same
+                // transition bookkeeping as every other reset path.
+                let res = Err(Error::library_reset(id, reason));
+                let actions = &mut self.actions;
+                return self.counts.transition(stream, |counts, stream| {
+                    actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+                });
             } else {
                 self.actions
                     .ensure_not_idle(self.counts.peer(), id)
@@ -849,7 +946,7 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         frame: frame::PushPromise,
-    ) -> Result<(), Error> {
+    ) -> Result<RecvOutcome, Error> {
         let id = frame.stream_id();
         let promised_id = frame.promised_id();
 
@@ -864,7 +961,12 @@ impl Inner {
                         id,
                         self.actions.recv.max_stream_id()
                     );
-                    return Ok(());
+                    return Ok(RecvOutcome::Processed);
+                }
+
+                if stream.is_pending_open {
+                    proto_err!(conn: "recv_push_promise: received frame on idle stream {:?}", id);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
 
                 // The stream must be receive open
@@ -881,10 +983,6 @@ impl Inner {
             }
         };
 
-        // TODO: Streams in the reserved states do not count towards the concurrency
-        // limit. However, it seems like there should be a cap otherwise this
-        // could grow in memory indefinitely.
-
         // Ensure that we can reserve streams
         self.actions.recv.ensure_can_reserve()?;
 
@@ -898,7 +996,7 @@ impl Inner {
             .open(promised_id, Open::PushPromise, &mut self.counts)?
             .is_none()
         {
-            return Ok(());
+            return Ok(RecvOutcome::Refused(promised_id));
         }
 
         // Try to handle the frame and create a corresponding key for the pushed stream
@@ -916,6 +1014,13 @@ impl Inner {
             let actions = &mut self.actions;
 
             self.counts.transition(stream, |counts, stream| {
+                // RFC 9113 excludes reserved streams from the concurrent stream
+                // count. Still, account reserved remote streams against the local
+                // receive limit so a peer cannot create an unbounded number of
+                // them by withholding the response HEADERS. `recv_headers` will
+                // see `is_counted` and avoid counting the stream a second time.
+                // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1.2
+                counts.inc_num_recv_streams(stream);
                 let stream_valid = actions.recv.recv_push_promise(frame, stream);
 
                 match stream_valid {
@@ -944,7 +1049,7 @@ impl Inner {
             parent.notify_push();
         };
 
-        Ok(())
+        Ok(RecvOutcome::Processed)
     }
 
     fn recv_eof<B>(
@@ -983,16 +1088,23 @@ impl Inner {
         Ok(())
     }
 
-    fn poll_complete<T, B>(
+    fn buffer_pending<T, B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
-        cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+        mut preface_ping: Option<&mut PrefacePing>,
+    ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        // A preface PING armed by an already buffered frame goes out first.
+        if let Some(preface_ping) = preface_ping.as_deref_mut()
+            && !preface_ping.buffer_pending(dst)
+        {
+            return Ok(BufferStatus::CodecFull);
+        }
+
         let mut send_buffer = send_buffer.inner.lock();
         let send_buffer = &mut *send_buffer;
 
@@ -1000,24 +1112,45 @@ impl Inner {
         //
         // TODO: It would probably be better to interleave updates w/ data
         // frames.
-        ready!(self
+        if self
             .actions
             .recv
-            .poll_complete(cx, &mut self.store, &mut self.counts, dst))?;
+            .buffer_pending(&mut self.store, &mut self.counts, dst)?
+            == BufferStatus::CodecFull
+        {
+            return Ok(BufferStatus::CodecFull);
+        }
 
         // Send any other pending frames
-        ready!(self.actions.send.poll_complete(
-            cx,
+        if self.actions.send.buffer_pending(
             send_buffer,
             &mut self.store,
             &mut self.counts,
-            dst
-        ))?;
+            &mut self.actions.recv,
+            dst,
+            preface_ping,
+        )? == BufferStatus::CodecFull
+        {
+            return Ok(BufferStatus::CodecFull);
+        }
 
-        // Nothing else to do, track the task
-        self.actions.task = Some(cx.waker().clone());
+        Ok(BufferStatus::Complete)
+    }
 
-        Poll::Ready(Ok(()))
+    fn reclaim_written_frame<T, B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> bool
+    where
+        B: Buf,
+    {
+        let mut send_buffer = send_buffer.inner.lock();
+        let send_buffer = &mut *send_buffer;
+
+        self.actions
+            .send
+            .reclaim_written_frame(send_buffer, &mut self.store, dst)
     }
 
     fn send_reset<B>(
@@ -1087,11 +1220,40 @@ where
             let mut stream = me.store.resolve(pending.key);
             tracing::trace!("poll_pending_open; stream = {:?}", stream.is_pending_open);
             if stream.is_pending_open {
-                stream.wait_send(cx);
+                stream.wait_open(cx);
                 return Poll::Pending;
             }
         }
         Poll::Ready(Ok(()))
+    }
+
+    /// Returns whether a stream is counted or a live request waits to open.
+    pub fn has_streams_or_pending_open(&self) -> bool {
+        let me = self.inner.lock();
+        me.counts.has_streams() || me.actions.send.has_pending_open(&me.store)
+    }
+
+    pub(crate) fn validate_initial_stream_window_size_update(
+        &self,
+        size: WindowSize,
+    ) -> Result<(), UserError> {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .validate_initial_stream_window_size_update(size)
+    }
+
+    pub(crate) fn set_initial_stream_window_size(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) {
+        self.inner
+            .lock()
+            .actions
+            .recv
+            .set_initial_stream_window_target(target, advertised);
     }
 }
 
@@ -1149,6 +1311,10 @@ where
         let me = self.inner.lock();
         me.store.num_wired_streams()
     }
+
+    pub(crate) fn sent_local_settings(&mut self, settings: &frame::Settings) {
+        self.inner.lock().actions.recv.sent_local_settings(settings);
+    }
 }
 
 // no derive because we don't need B and P to be Clone.
@@ -1173,10 +1339,10 @@ where
     fn drop(&mut self) {
         let mut inner = self.inner.lock();
         inner.refs -= 1;
-        if inner.refs == 1 {
-            if let Some(task) = inner.actions.task.take() {
-                task.wake();
-            }
+        if inner.refs == 1
+            && let Some(task) = inner.actions.task.take()
+        {
+            task.wake();
         }
     }
 }
@@ -1521,7 +1687,19 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
 
-        me.actions.recv.poll_data(cx, &mut stream)
+        me.actions
+            .recv
+            .poll_data(cx, &mut stream)
+            .map(|result| match result {
+                Some(Ok(data)) => {
+                    if data.is_budgeted {
+                        me.counts.release_data_frame(data.payload.len());
+                    }
+                    Some(Ok(data.payload))
+                }
+                Some(Err(err)) => Some(Err(err)),
+                None => None,
+            })
     }
 
     pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
@@ -1569,7 +1747,9 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
         stream.is_recv = false;
-        me.actions.recv.clear_recv_buffer(&mut stream);
+        me.actions
+            .recv
+            .clear_recv_buffer(&mut stream, &mut me.actions.task, &mut me.counts);
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -1639,10 +1819,11 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     // closed (does not have to go through logic below
     // of canceling the stream), we should notify the task
     // (connection) so that it can close properly
-    if stream.ref_count == 0 && stream.is_closed() {
-        if let Some(task) = actions.task.take() {
-            task.wake();
-        }
+    if stream.ref_count == 0
+        && stream.is_closed()
+        && let Some(task) = actions.task.take()
+    {
+        task.wake();
     }
 
     me.counts.transition(stream, |counts, stream| {
@@ -1653,13 +1834,18 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &mut actions.task);
+                .release_closed_capacity(stream, &mut actions.task, counts);
 
             // We won't be able to reach our push promises anymore
             let mut ppp = stream.pending_push_promises.take();
             while let Some(promise) = ppp.pop(stream.store_mut()) {
                 counts.transition(promise, |counts, stream| {
                     maybe_cancel(stream, actions, counts);
+                    // Discard unreachable push data and return connection credit.
+                    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.1
+                    actions
+                        .recv
+                        .release_closed_capacity(stream, &mut actions.task, counts);
                 });
             }
         }
@@ -1742,6 +1928,21 @@ impl Actions {
 
             Ok(())
         })
+    }
+
+    fn reset_on_recv_stream_err_deferred<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        res: Result<(), Error>,
+    ) -> Result<(), Error> {
+        if matches!(res, Err(Error::Reset(..))) {
+            let mut send_buffer = send_buffer.inner.lock();
+            self.reset_on_recv_stream_err(&mut send_buffer, stream, counts, res)
+        } else {
+            res
+        }
     }
 
     fn reset_on_recv_stream_err<B>(

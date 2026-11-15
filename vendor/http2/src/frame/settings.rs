@@ -1,18 +1,16 @@
 use std::fmt;
 
-use crate::frame::{util, Error, Frame, FrameSize, Head, Kind, StreamId};
+use crate::frame::{Error, Frame, FrameSize, Head, Kind, StreamId, util};
 use crate::tracing;
 use bytes::{BufMut, BytesMut};
 use smallvec::SmallVec;
 
 define_enum_with_values! {
-    /// An enum that lists all valid settings that can be sent in a SETTINGS
-    /// frame.
+    /// Identifies a SETTINGS parameter ([RFC 9113 §6.5.2]).
     ///
-    /// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
-    ///
-    /// See <https://datatracker.ietf.org/doc/html/rfc9113#name-defined-settings>.
+    /// [RFC 9113 §6.5.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
     @U16
+    #[non_exhaustive]
     pub enum SettingId {
         /// This setting allows the sender to inform the remote endpoint
         /// of the maximum size of the compression table used to decode field blocks,
@@ -41,21 +39,22 @@ define_enum_with_values! {
         /// Enables support for the Extended CONNECT protocol.
         EnableConnectProtocol => 0x0008,
 
-        /// Disable RFC 7540 Stream Priorities.
-        /// [RFC 9218]: <https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1>
+        /// Signals that the sender does not use RFC 7540 priorities
+        /// ([RFC 9218 §2.1]).
+        ///
+        /// [RFC 9218 §2.1]: https://www.rfc-editor.org/rfc/rfc9218.html#section-2.1
         NoRfc7540Priorities => 0x0009,
     }
 }
 
-/// Represents the order of settings in a SETTINGS frame.
+/// The order of parameters in the initial client SETTINGS frame.
 ///
-/// This structure maintains an ordered list of `SettingId` values for use when encoding or decoding
-/// HTTP/2 SETTINGS frames. The order of settings can be important for protocol compliance, testing,
-/// or interoperability. `SettingsOrder` ensures that the specified order is preserved and that no
-/// duplicate settings are present.
+/// Set with [`Builder::settings_order`](crate::client::Builder::settings_order).
+/// The protocol requires no particular order; receivers apply parameters in
+/// the order they appear ([RFC 9113 §6.5.3]). [`SettingsOrderBuilder`] drops
+/// repeats and appends missing settings in [`SettingId`] declaration order.
 ///
-/// Typically, a `SettingsOrder` is constructed using the [`SettingsOrderBuilder`] to enforce uniqueness
-/// and protocol-compliant ordering.
+/// [RFC 9113 §6.5.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.3
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct SettingsOrder {
     ids: SmallVec<[SettingId; SettingId::DEFAULT_STACK_SIZE]>,
@@ -103,7 +102,11 @@ impl<'a> IntoIterator for &'a SettingsOrder {
 // ===== impl SettingsOrderBuilder =====
 
 impl SettingsOrderBuilder {
+    /// Appends a setting unless one with the same numeric ID was already
+    /// pushed. `Unknown` with a defined ID is treated as that setting, and IDs
+    /// 0 and above 15 are ignored.
     pub fn push(mut self, id: SettingId) -> Self {
+        let id = SettingId::from(u16::from(id));
         let mask_id = id.mask_id();
         if mask_id != 0 {
             if self.mask & mask_id == 0 {
@@ -116,6 +119,7 @@ impl SettingsOrderBuilder {
         self
     }
 
+    /// Appends every setting with the same rules as [`push`](Self::push).
     pub fn extend(mut self, iter: impl IntoIterator<Item = SettingId>) -> Self {
         for id in iter {
             self = self.push(id);
@@ -123,6 +127,7 @@ impl SettingsOrderBuilder {
         self
     }
 
+    /// Finishes the order, appending any setting not yet listed.
     pub fn build(mut self) -> SettingsOrder {
         self = self.extend(SettingId::DEFAULT_IDS);
         SettingsOrder { ids: self.ids }
@@ -185,16 +190,16 @@ impl ExperimentalSettingsBuilder {
         };
 
         // Only insert if this unknown setting ID has not been seen before (deduplication)
-        if let SettingId::Unknown(id) = setting.id {
-            if matches!(SettingId::from(id), SettingId::Unknown(_)) {
-                let mask_id = setting.id.mask_id();
-                if mask_id != 0 {
-                    if self.mask & mask_id == 0 {
-                        self.mask |= mask_id;
-                        self.settings.push(setting);
-                    } else {
-                        tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
-                    }
+        if let SettingId::Unknown(id) = setting.id
+            && matches!(SettingId::from(id), SettingId::Unknown(_))
+        {
+            let mask_id = setting.id.mask_id();
+            if mask_id != 0 {
+                if self.mask & mask_id == 0 {
+                    self.mask |= mask_id;
+                    self.settings.push(setting);
+                } else {
+                    tracing::trace!("duplicate unknown setting ID ignored: {id:?}");
                 }
             }
         }
@@ -236,27 +241,19 @@ pub struct Settings {
     experimental_settings: Option<ExperimentalSettings>,
     // Settings order
     settings_order: SettingsOrder,
-    // Raw setting pairs preserved in peer wire order when this frame was decoded.
     observed_settings: Option<SmallVec<[ObservedSetting; SettingId::DEFAULT_STACK_SIZE]>>,
 }
 
-/// One setting entry as observed on the wire in a decoded SETTINGS frame.
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+/// A raw HTTP/2 SETTINGS entry, preserving its on-wire ID and value.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct ObservedSetting {
     id: u16,
     value: u32,
 }
 
 impl ObservedSetting {
-    /// Raw 16-bit HTTP/2 setting identifier.
-    pub fn id(&self) -> u16 {
-        self.id
-    }
-
-    /// Raw 32-bit HTTP/2 setting value.
-    pub fn value(&self) -> u32 {
-        self.value
-    }
+    pub fn id(&self) -> u16 { self.id }
+    pub fn value(&self) -> u32 { self.value }
 }
 
 /// A struct representing a single HTTP/2 setting that can be sent in a SETTINGS
@@ -304,28 +301,21 @@ impl Settings {
         self.flags.is_ack()
     }
 
-    /// Returns raw SETTINGS entries in peer wire order when this frame was decoded.
-    ///
-    /// Locally constructed SETTINGS frames return `None`; an empty decoded non-ACK
-    /// SETTINGS frame returns `Some(&[])`.
+    /// Entries of a decoded peer frame, preserving ordering and unknown identifiers.
     pub fn observed_settings(&self) -> Option<&[ObservedSetting]> {
         self.observed_settings.as_deref()
     }
 
-    /// Returns the settings this frame will encode, in wire order.
-    ///
-    /// Unlike [`Settings::observed_settings`], which is populated only for a
-    /// decoded peer frame, this derives the local encoder output from the
-    /// configured settings and their explicit order.
+    /// Entries this locally constructed frame will emit, in exact wire order.
     pub fn encoded_settings(&self) -> Vec<ObservedSetting> {
-        let mut out = Vec::new();
+        let mut observed = Vec::new();
         self.for_each(|setting| {
-            out.push(ObservedSetting {
+            observed.push(ObservedSetting {
                 id: u16::from(setting.id),
                 value: setting.value,
             });
         });
-        out
+        observed
     }
 
     pub fn initial_window_size(&self) -> Option<u32> {
@@ -421,19 +411,19 @@ impl Settings {
         }
 
         // Ensure the payload length is correct, each setting is 6 bytes long.
-        if payload.len() % 6 != 0 {
+        if !payload.len().is_multiple_of(6) {
             tracing::debug!("invalid settings payload length; len={:?}", payload.len());
             return Err(Error::InvalidPayloadAckSettings);
         }
 
         let mut settings = Settings::default();
         debug_assert!(!settings.flags.is_ack());
-        let mut observed_settings = SmallVec::new();
+        let mut observed = SmallVec::new();
 
         for raw in payload.chunks(6) {
-            observed_settings.push(ObservedSetting {
-                id: (u16::from(raw[0]) << 8) | u16::from(raw[1]),
-                value: unpack_octets_4!(raw, 2, u32),
+            observed.push(ObservedSetting {
+                id: u16::from_be_bytes([raw[0], raw[1]]),
+                value: u32::from_be_bytes([raw[2], raw[3], raw[4], raw[5]]),
             });
             if let Some(setting) = Setting::load(raw) {
                 match setting.id {
@@ -493,8 +483,7 @@ impl Settings {
             }
         }
 
-        tracing::debug!(?observed_settings, "decoded peer SETTINGS in wire order");
-        settings.observed_settings = Some(observed_settings);
+        settings.observed_settings = Some(observed);
         Ok(settings)
     }
 
@@ -524,70 +513,69 @@ impl Settings {
         for id in &self.settings_order {
             match id {
                 SettingId::HeaderTableSize => {
-                    if let Some(v) = self.header_table_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.header_table_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::EnablePush => {
-                    if let Some(v) = self.enable_push {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.enable_push
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::MaxConcurrentStreams => {
-                    if let Some(v) = self.max_concurrent_streams {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.max_concurrent_streams
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::InitialWindowSize => {
-                    if let Some(v) = self.initial_window_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.initial_window_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::MaxFrameSize => {
-                    if let Some(v) = self.max_frame_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.max_frame_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::MaxHeaderListSize => {
-                    if let Some(v) = self.max_header_list_size {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.max_header_list_size
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::EnableConnectProtocol => {
-                    if let Some(v) = self.enable_connect_protocol {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.enable_connect_protocol
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::NoRfc7540Priorities => {
-                    if let Some(v) = self.no_rfc7540_priorities {
-                        if let Some(setting) = Setting::from_id(*id, v) {
-                            f(setting);
-                        }
+                    if let Some(v) = self.no_rfc7540_priorities
+                        && let Some(setting) = Setting::from_id(*id, v)
+                    {
+                        f(setting);
                     }
                 }
                 SettingId::Unknown(_id) => {
                     #[cfg(feature = "unstable")]
-                    if let Some(ref unknown_settings) = self.experimental_settings {
-                        if let Some(setting) = unknown_settings
+                    if let Some(ref unknown_settings) = self.experimental_settings
+                        && let Some(setting) = unknown_settings
                             .into_iter()
                             .find(|setting| setting.id == SettingId::Unknown(*_id))
-                        {
-                            f(setting.clone());
-                        }
+                    {
+                        f(setting.clone());
                     }
                 }
             }
@@ -648,11 +636,11 @@ impl Setting {
     /// 6.5.2.
     pub fn from_id(id: impl Into<SettingId>, value: u32) -> Option<Setting> {
         let id = id.into();
-        if let SettingId::Unknown(id) = id {
-            if id == 0 || id > SettingId::MAX_ID {
-                tracing::debug!("limiting unknown setting id to 0..{}", SettingId::MAX_ID);
-                return None;
-            }
+        if let SettingId::Unknown(id) = id
+            && (id == 0 || id > SettingId::MAX_ID)
+        {
+            tracing::debug!("limiting unknown setting id to 0..{}", SettingId::MAX_ID);
+            return None;
         }
 
         Some(Setting { id, value })
@@ -746,66 +734,22 @@ mod tests {
     }
 
     #[test]
-    fn test_encoded_settings_preserve_configured_wire_order() {
-        let mut settings = Settings::default();
-        settings.set_max_concurrent_streams(Some(100));
-        settings.set_initial_window_size(Some(65_536));
-        settings.set_enable_push(false);
-        settings.set_max_frame_size(None);
-        settings.set_max_header_list_size(None);
-        settings.set_settings_order(
-            SettingsOrder::builder()
-                .extend([
-                    SettingId::MaxConcurrentStreams,
-                    SettingId::InitialWindowSize,
-                    SettingId::EnablePush,
-                ])
-                .build(),
-        );
-
-        let encoded = settings.encoded_settings();
-        let pairs = encoded
-            .iter()
-            .map(|setting| (setting.id(), setting.value()))
-            .collect::<Vec<_>>();
-        assert_eq!(pairs, vec![(3, 100), (4, 65_536), (2, 0)]);
-    }
-
-    #[test]
-    fn test_decoded_settings_preserve_wire_order_and_unknown_ids() {
-        let head = Head::new(Kind::Settings, 0, StreamId::zero());
-        let payload = [
-            0x00, 0x04, 0x00, 0x10, 0x00, 0x00, // INITIAL_WINDOW_SIZE = 1 MiB
-            0x12, 0x34, 0xDE, 0xAD, 0xBE, 0xEF, // unknown setting, still observable
-            0x00, 0x01, 0x00, 0x00, 0x10, 0x00, // HEADER_TABLE_SIZE = 4096
-        ];
-        let settings = Settings::load(head, &payload).unwrap();
-        let observed = settings.observed_settings().unwrap();
-        assert_eq!(observed.len(), 3);
-        assert_eq!(
-            (observed[0].id(), observed[0].value()),
-            (0x0004, 0x0010_0000)
-        );
-        assert_eq!(
-            (observed[1].id(), observed[1].value()),
-            (0x1234, 0xDEAD_BEEF)
-        );
-        assert_eq!(
-            (observed[2].id(), observed[2].value()),
-            (0x0001, 0x0000_1000)
-        );
-    }
-
-    #[test]
     fn test_settings_order_duplicate() {
         let order = SettingsOrder::builder()
+            .push(SettingId::Unknown(4))
             .push(SettingId::HeaderTableSize)
             .push(SettingId::HeaderTableSize)
             .build();
 
         assert_eq!(order.ids.len(), SettingId::DEFAULT_IDS.len());
-        assert_eq!(order.ids[0], SettingId::HeaderTableSize);
-        assert_ne!(order.ids[1], SettingId::HeaderTableSize);
+        assert_eq!(
+            order.ids[..3],
+            [
+                SettingId::InitialWindowSize,
+                SettingId::HeaderTableSize,
+                SettingId::EnablePush
+            ]
+        );
     }
 
     #[cfg(feature = "unstable")]

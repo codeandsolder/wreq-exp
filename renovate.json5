@@ -8,9 +8,9 @@
   "ignorePaths": ["vendor/**"],
   "packageRules": [
     {
-      "description": "Keep the vendored transport stack pinned until it is rebased deliberately",
+      "description": "Maintain fork-specific telemetry patches in vendored transport crates",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["http2", "wreq-proto", "wreq-rt"],
+      "matchPackageNames": ["http2", "netty"],
       "enabled": false
     },
     {

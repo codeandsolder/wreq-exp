@@ -76,6 +76,11 @@ pub(super) struct VacantEntry<'a> {
 
 pub(super) trait Resolve {
     fn resolve(&mut self, key: Key) -> Ptr<'_>;
+
+    /// Key of the stream the caller still holds through this resolver.
+    fn held_key(&self) -> Option<Key> {
+        None
+    }
 }
 
 // ===== impl Store =====
@@ -89,9 +94,9 @@ impl Store {
     }
 
     pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
-        let index = match self.ids.get(id) {
-            Some(key) => *key,
-            None => return None,
+        let index = {
+            let key = self.ids.get(id)?;
+            *key
         };
 
         Some(Ptr {
@@ -363,6 +368,19 @@ where
         self.indices.is_none()
     }
 
+    /// Returns whether any queued stream satisfies `f`, checking from the head.
+    pub fn any(&self, store: &Store, f: impl Fn(&Stream) -> bool) -> bool {
+        let mut next = self.indices.map(|idxs| idxs.head);
+        while let Some(key) = next {
+            let stream = &store[key];
+            if f(stream) {
+                return true;
+            }
+            next = N::next(stream);
+        }
+        false
+    }
+
     pub fn pop_if<'a, R, F>(&mut self, store: &'a mut R, f: F) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
@@ -403,7 +421,7 @@ impl<'a> Ptr<'a> {
     /// Remove the stream from the store
     pub fn remove(self) -> StreamId {
         // The stream must have been unlinked before this point
-        debug_assert!(!self.store.ids.contains_key(&self.key.stream_id));
+        debug_assert!(!self.is_linked());
 
         // Remove the stream state
         let stream = self.store.slab.remove(self.key.index.0 as usize);
@@ -414,10 +432,16 @@ impl<'a> Ptr<'a> {
     /// Remove the StreamId -> stream state association.
     ///
     /// This will effectively remove the stream as far as the H2 protocol is
-    /// concerned.
+    /// concerned. Once unlinked, the id may map to a newer stream, such as one
+    /// created to reset a late frame, which is left alone.
     pub fn unlink(&mut self) {
-        let id = self.key.stream_id;
-        self.store.ids.swap_remove(&id);
+        if self.is_linked() {
+            self.store.ids.swap_remove(&self.key.stream_id);
+        }
+    }
+
+    fn is_linked(&self) -> bool {
+        self.store.ids.get(&self.key.stream_id) == Some(&self.key.index)
     }
 }
 
@@ -427,6 +451,10 @@ impl<'a> Resolve for Ptr<'a> {
             key,
             store: &mut *self.store,
         }
+    }
+
+    fn held_key(&self) -> Option<Key> {
+        Some(self.key)
     }
 }
 

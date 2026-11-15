@@ -1,5 +1,5 @@
 use crate::codec::UserError;
-use crate::frame::{Priorities, PseudoOrder, Reason, StreamDependency, StreamId};
+use crate::frame::{Priorities, Priority, PseudoOrder, Reason, StreamId};
 use crate::{client, server, tracing};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
@@ -11,8 +11,9 @@ use std::io;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
-use tokio::io::AsyncRead;
+use std::time::{Duration, Instant};
+use std::vec::IntoIter;
+use tokio::io::{AsyncRead, ReadBuf};
 
 /// An H2 connection
 #[derive(Debug)]
@@ -45,8 +46,14 @@ where
     /// Pending GOAWAY frames to write.
     go_away: GoAway,
 
+    /// A refused stream to reset before receiving another frame.
+    pending_refusal: Option<StreamId>,
+
     /// Ping/pong handler
     ping_pong: PingPong,
+
+    /// Whether bytes were read since `take_read_activity` was last called.
+    read_activity: bool,
 
     /// Connection settings
     settings: Settings,
@@ -84,13 +91,61 @@ pub(crate) struct Config {
     pub remote_reset_stream_max: usize,
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
+    pub data_frame_budget: DataFrameBudget,
     pub headers_pseudo_order: Option<PseudoOrder>,
-    pub headers_stream_dependency: Option<StreamDependency>,
+    pub headers_priority_policy: HeadersPriorityPolicy,
     pub priorities: Option<Priorities>,
+    pub preface_ping: Option<Duration>,
+    pub preface_ping_timeout: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DataFrameBudget {
+    Auto,
+    Configured(usize),
+}
+
+impl DataFrameBudget {
+    pub(crate) fn resolve(self, connection_window: Option<WindowSize>) -> usize {
+        match self {
+            Self::Configured(budget) => budget,
+            Self::Auto => {
+                let window = connection_window.unwrap_or(DEFAULT_INITIAL_WINDOW_SIZE);
+                let budget = window as usize / 2;
+
+                budget.max(DEFAULT_DATA_FRAME_BUDGET)
+            }
+        }
+    }
+
+    pub(crate) fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 #[derive(Debug)]
 enum State {
+    /// The client connection item still needs its optional WINDOW_UPDATE and
+    /// configured PRIORITY frames.
+    ClientInitialSend {
+        /// Configured PRIORITY frames to encode after the optional connection
+        /// WINDOW_UPDATE. RFC 9113 deprecates this signal but retains its frame
+        /// definition for RFC 7540 interoperability; see sections 5.3.2 and 6.3:
+        /// https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
+        /// https://www.rfc-editor.org/rfc/rfc9113.html#section-6.3
+        pending_priorities: Option<IntoIter<Priority>>,
+    },
+
+    /// The client connection item is being encoded or written.
+    ///
+    /// Request frames remain queued until this item is fully written. The codec
+    /// can still contain unwritten bytes after `pending_priorities` becomes
+    /// `None`.
+    ClientInitialWrite {
+        /// PRIORITY frames not yet encoded into the connection item.
+        pending_priorities: Option<IntoIter<Priority>>,
+    },
+
     /// Currently open in a sane state
     Open,
 
@@ -107,8 +162,8 @@ where
     P: Peer,
     B: Buf,
 {
-    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
-        fn streams_config(config: &Config) -> streams::Config {
+    pub fn new(codec: Codec<T, Prioritized<B>>, mut config: Config) -> Connection<T, P, B> {
+        fn streams_config(config: &mut Config) -> streams::Config {
             streams::Config {
                 initial_max_send_streams: config.initial_max_send_streams,
                 local_max_buffer_size: config.max_send_buffer_size,
@@ -127,23 +182,36 @@ where
                     .max_concurrent_streams()
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
-                headers_stream_dependency: config.headers_stream_dependency,
+                data_frame_budget: config.data_frame_budget,
+                headers_priority_policy: std::mem::take(&mut config.headers_priority_policy),
                 headers_pseudo_order: config.headers_pseudo_order.clone(),
-                priorities: config.priorities.clone(),
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let state = if P::r#dyn().is_server() {
+            State::Open
+        } else {
+            let pending_priorities = config
+                .priorities
+                .take()
+                .filter(|priorities| !priorities.is_empty())
+                .map(IntoIterator::into_iter);
+            State::ClientInitialSend { pending_priorities }
+        };
+        let streams = Streams::new(streams_config(&mut config));
         #[cfg(feature = "tracing")]
         let span = ::tracing::debug_span!(parent: None, "Connection", peer = %P::NAME);
         #[cfg(feature = "tracing")]
         span.follows_from(::tracing::Span::current());
+
         Connection {
             codec,
             inner: ConnectionInner {
-                state: State::Open,
+                state,
                 error: None,
                 go_away: GoAway::new(),
-                ping_pong: PingPong::new(),
+                pending_refusal: None,
+                ping_pong: PingPong::new(config.preface_ping, config.preface_ping_timeout),
+                read_activity: false,
                 settings: Settings::new(config.settings),
                 streams,
                 #[cfg(feature = "tracing")]
@@ -199,14 +267,32 @@ where
         #[cfg(feature = "tracing")]
         let _e = self.inner.span.enter();
         let _span = tracing::trace_span!("poll_ready");
+        // A preface PING armed by an already buffered frame goes first.
+        self.inner
+            .ping_pong
+            .send_pending_preface_ping(cx, &mut self.codec)?;
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
-        ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
-        ready!(self
-            .inner
-            .settings
-            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
-        ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
+        // A shutdown PING follows its GOAWAY.
+        if !self.inner.go_away.has_pending() {
+            self.inner
+                .ping_pong
+                .send_pending_ping(cx, &mut self.codec)?;
+        }
+        ready!(
+            self.inner
+                .settings
+                .poll_send(cx, &mut self.codec, &mut self.inner.streams)
+        )?;
+        if let Some(id) = self.inner.pending_refusal {
+            // Keep the refusal pending if making room requires socket progress.
+            ready!(self.codec.poll_send_capacity(cx))?;
+            self.inner.streams.count_pending_refusal()?;
+            self.codec
+                .buffer(frame::Reset::new(id, Reason::REFUSED_STREAM).into())
+                .expect("invalid RST_STREAM frame");
+            self.inner.pending_refusal = None;
+        }
 
         Poll::Ready(Ok(()))
     }
@@ -217,6 +303,29 @@ where
     /// afterwards. If this is a graceful shutdown, this returns `None`.
     fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
         self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+    }
+
+    /// Drops incoming bytes while our last frames wait to be written: the peer
+    /// may wait for us to read before it reads them.
+    ///
+    /// The bytes skip the codec, as no frame is read after this, but still
+    /// count as reads, for read activity and the preface PING timeout.
+    // Out of line, so the scratch buffer stays off the stack of `poll`.
+    #[cold]
+    #[inline(never)]
+    fn discard_input(&mut self, cx: &mut Context) {
+        let mut scratch = [0; 8 * 1024];
+        loop {
+            let mut buf = ReadBuf::new(&mut scratch);
+            match Pin::new(self.codec.get_mut()).poll_read(cx, &mut buf) {
+                Poll::Ready(Ok(())) if !buf.filled().is_empty() => {
+                    self.inner.read_activity = true;
+                    self.inner.ping_pong.record_read();
+                }
+                // Stop on EOF or an error, and wait for the write side.
+                _ => return,
+            }
+        }
     }
 
     pub fn go_away_from_user(&mut self, e: Reason) {
@@ -248,8 +357,12 @@ where
     /// iff there are no streams or references
     pub fn maybe_close_connection_if_no_streams(&mut self) {
         // If we poll() and realize that there are no streams or references
-        // then we can close the connection by transitioning to GOAWAY
-        if !self.inner.streams.has_streams_or_other_references() {
+        // then we can close the connection by transitioning to GOAWAY. The
+        // client initial state performs this check once its connection item
+        // has been written.
+        if matches!(self.inner.state, State::Open)
+            && !self.inner.streams.has_streams_or_other_references()
+        {
             self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
         }
     }
@@ -270,6 +383,99 @@ where
         self.inner.ping_pong.take_user_pings()
     }
 
+    /// Writes the client connection-level item before draining request frames.
+    ///
+    /// This method is called only by `Connection::poll`. Like the upstream
+    /// handshake write, it waits for write progress instead of introducing a
+    /// separate receive loop while the connection-level item is pending.
+    fn advance_client_initial_send(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+        if matches!(&self.inner.state, State::ClientInitialSend { .. }) {
+            if let Err(err) = self
+                .inner
+                .streams
+                .buffer_client_initial_window_update(&mut self.codec)
+            {
+                return Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())));
+            }
+
+            let pending_priorities = match &mut self.inner.state {
+                State::ClientInitialSend { pending_priorities } => pending_priorities.take(),
+                _ => None,
+            };
+            self.inner.state = State::ClientInitialWrite { pending_priorities };
+            tracing::debug!(
+                "client connection preface, settings, and optional window update ready"
+            );
+        } else if !matches!(&self.inner.state, State::ClientInitialWrite { .. }) {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Append configured legacy RFC 7540 PRIORITY nodes after the optional
+        // WINDOW_UPDATE. Keeping them in the connection item sends them once
+        // and prevents them from entering a request stream queue.
+        loop {
+            if !self.codec.has_send_capacity() {
+                match self.codec.poll_write_buffered(cx) {
+                    Poll::Ready(Ok(())) => continue,
+                    Poll::Ready(Err(err)) => {
+                        return Poll::Ready(
+                            self.inner.as_dyn().handle_poll2_result(Err(err.into())),
+                        );
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            let priority = match &mut self.inner.state {
+                State::ClientInitialWrite { pending_priorities } => {
+                    let priority = pending_priorities.as_mut().and_then(Iterator::next);
+                    if priority.is_none() {
+                        *pending_priorities = None;
+                    }
+                    priority
+                }
+                _ => None,
+            };
+
+            match priority {
+                Some(priority) => {
+                    tracing::trace!(?priority, "buffering client initial PRIORITY");
+                    if let Err(err) = self.codec.buffer(priority.into()) {
+                        let err = io::Error::new(io::ErrorKind::InvalidInput, err);
+                        return Poll::Ready(
+                            self.inner.as_dyn().handle_poll2_result(Err(err.into())),
+                        );
+                    }
+                }
+                None => break,
+            }
+        }
+
+        #[cfg(feature = "tracing")]
+        let _span1 = self.inner.span.clone().entered();
+        #[cfg(feature = "tracing")]
+        let _span2 = tracing::trace_span!("advance_client_initial_send");
+
+        match self.codec.poll_write_buffered(cx) {
+            Poll::Ready(Ok(())) => {
+                tracing::debug!(
+                    "client initial connection write complete; entering normal polling"
+                );
+                self.inner.state = State::Open;
+                self.codec.start_one_frame_per_write();
+                self.maybe_close_connection_if_no_streams();
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => {
+                Poll::Ready(self.inner.as_dyn().handle_poll2_result(Err(err.into())))
+            }
+            Poll::Pending => {
+                tracing::debug!("client initial connection write blocked");
+                Poll::Pending
+            }
+        }
+    }
+
     /// Advances the internal state of the connection.
     pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // XXX(eliza): cloning the span is unfortunately necessary here in
@@ -284,16 +490,58 @@ where
             tracing::trace!(connection.state = ?self.inner.state);
             // TODO: probably clean up this glob of code
             match self.inner.state {
+                State::ClientInitialSend { .. } | State::ClientInitialWrite { .. } => {
+                    ready!(self.advance_client_initial_send(cx))?;
+                    continue;
+                }
                 // When open, continue to poll a frame
                 State::Open => {
-                    let result = match self.poll2(cx) {
+                    let polled = self.poll2(cx);
+                    // Reads reset the idle time before a preface PING can be
+                    // armed below, and move its timeout, even if they close
+                    // the connection.
+                    if self.codec.take_read_activity() {
+                        self.inner.ping_pong.record_read();
+                        self.inner.read_activity = true;
+                    }
+
+                    let result = match polled {
                         Poll::Ready(result) => result,
                         // The connection is not ready to make progress
                         Poll::Pending => {
+                            // A preface PING left unanswered with no reads for
+                            // its timeout fails the connection. A GOAWAY still
+                            // waiting for room when it expires, this one
+                            // included, moves to closing without being written
+                            // and keeps its reason.
+                            if self.preface_ping_expired() {
+                                let reason = self
+                                    .inner
+                                    .go_away
+                                    .going_away()
+                                    .map_or(Reason::PROTOCOL_ERROR, |going_away| {
+                                        going_away.reason()
+                                    });
+                                self.inner.as_dyn().handle_go_away(
+                                    reason,
+                                    Bytes::from_static(b"Failed ping."),
+                                    Initiator::Library,
+                                );
+                                continue;
+                            }
+
+                            // Frames that may rely on received SETTINGS
+                            // follow their ACK.
+                            ready!(self.inner.settings.poll_send_acks(cx, &mut self.codec))?;
+
                             // Ensure all window updates have been sent.
                             //
                             // This will also handle flushing `self.codec`
-                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+                            ready!(self.inner.streams.poll_complete(
+                                cx,
+                                &mut self.codec,
+                                self.inner.ping_pong.preface_ping_mut()
+                            ))?;
 
                             if (self.inner.error.is_some()
                                 || self.inner.go_away.should_close_on_idle())
@@ -303,6 +551,10 @@ where
                                 continue;
                             }
 
+                            // An idle connection keeps no grown write buffer.
+                            self.codec
+                                .release_write_buffer(|| !self.inner.streams.has_streams());
+
                             return Poll::Pending;
                         }
                     };
@@ -311,8 +563,12 @@ where
                 }
                 State::Closing(reason, initiator) => {
                     tracing::trace!("connection closing after flush");
-                    // Flush/shutdown the codec
-                    ready!(self.codec.shutdown(cx))?;
+                    // Flush/shutdown the codec, without waiting for a peer
+                    // that timed out a preface PING.
+                    if self.codec.shutdown(cx)?.is_pending() && !self.preface_ping_expired() {
+                        self.discard_input(cx);
+                        return Poll::Pending;
+                    }
 
                     // Transition the state to error
                     self.inner.state = State::Closed(reason, initiator);
@@ -336,7 +592,12 @@ where
             // The order here matters:
             // - poll_go_away may buffer a graceful shutdown GOAWAY frame
             // - If it has, we've also added a PING to be sent in poll_ready
-            if let Some(reason) = ready!(self.poll_go_away(cx)?) {
+            let go_away = self.poll_go_away(cx);
+            if go_away.is_pending() {
+                // Only a GOAWAY that closes the connection waits for room.
+                self.discard_input(cx);
+            }
+            if let Some(reason) = ready!(go_away?) {
                 if self.inner.go_away.should_close_now() {
                     if self.inner.go_away.is_user_initiated() {
                         // A user initiated abrupt shutdown shouldn't return
@@ -367,6 +628,10 @@ where
                         &mut self.inner.streams,
                     )?;
                 }
+                ReceivedFrame::Refused(id) => {
+                    debug_assert!(self.inner.pending_refusal.is_none());
+                    self.inner.pending_refusal = Some(id);
+                }
                 ReceivedFrame::Continue => (),
                 ReceivedFrame::Done => {
                     return Poll::Ready(Ok(()));
@@ -377,6 +642,33 @@ where
 
     fn clear_expired_reset_streams(&mut self) {
         self.inner.streams.clear_expired_reset_streams();
+    }
+
+    /// Returns whether bytes were read since the last call.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        // Reads not yet moved here by `poll` stay in the codec.
+        std::mem::take(&mut self.inner.read_activity) | self.codec.take_read_activity()
+    }
+
+    /// Returns when the unanswered preface PING times out, unless a GOAWAY of
+    /// the user's own waits to be written.
+    pub(crate) fn preface_ping_deadline(&self) -> Option<Instant> {
+        let checked = match self.inner.state {
+            State::Open => !self.inner.go_away.is_user_initiated(),
+            State::Closing(..) => !self.inner.go_away.is_user_buffered(),
+            _ => false,
+        };
+        checked.then(|| self.inner.ping_pong.preface_ping_deadline())?
+    }
+
+    fn preface_ping_expired(&self) -> bool {
+        self.preface_ping_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
+    /// Returns the remote extended CONNECT setting, or `None` before its initial SETTINGS.
+    pub(crate) fn remote_extended_connect(&self) -> Option<bool> {
+        self.inner.settings.remote_extended_connect()
     }
 }
 
@@ -415,7 +707,17 @@ where
         self.go_away.go_away(frame);
     }
 
+    /// Closes the connection with a GOAWAY of `e`, unless an error GOAWAY
+    /// already closes it: that one keeps its reason, even while it waits for
+    /// room.
     fn go_away_now(&mut self, e: Reason) {
+        if self
+            .go_away
+            .going_away()
+            .is_some_and(|going_away| going_away.reason() != Reason::NO_ERROR)
+        {
+            return;
+        }
         let last_processed_id = self.streams.last_processed_id();
         let frame = frame::GoAway::new(last_processed_id, e);
         self.go_away.go_away_now(frame);
@@ -512,7 +814,7 @@ where
         if self
             .go_away
             .going_away()
-            .map_or(false, |frame| frame.reason() == reason)
+            .is_some_and(|frame| frame.reason() == reason)
         {
             tracing::trace!("    -> already going away");
             *self.state = State::Closing(reason, initiator);
@@ -529,7 +831,10 @@ where
         match frame {
             Some(Headers(frame)) => {
                 tracing::trace!(?frame, "recv HEADERS");
-                self.streams.recv_headers(frame)?;
+                match self.streams.recv_headers(frame)? {
+                    streams::RecvOutcome::Processed => (),
+                    streams::RecvOutcome::Refused(id) => return Ok(ReceivedFrame::Refused(id)),
+                }
             }
             Some(Data(frame)) => {
                 tracing::trace!(?frame, "recv DATA");
@@ -541,7 +846,10 @@ where
             }
             Some(PushPromise(frame)) => {
                 tracing::trace!(?frame, "recv PUSH_PROMISE");
-                self.streams.recv_push_promise(frame)?;
+                match self.streams.recv_push_promise(frame)? {
+                    streams::RecvOutcome::Processed => (),
+                    streams::RecvOutcome::Refused(id) => return Ok(ReceivedFrame::Refused(id)),
+                }
             }
             Some(Settings(frame)) => {
                 tracing::trace!(?frame, "recv SETTINGS");
@@ -588,6 +896,7 @@ where
 }
 
 enum ReceivedFrame {
+    Refused(StreamId),
     Settings(frame::Settings),
     Continue,
     Done,
@@ -600,6 +909,31 @@ where
 {
     pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
         &self.inner.streams
+    }
+
+    pub(crate) fn set_client_initial_window_size(
+        &mut self,
+        size: WindowSize,
+    ) -> Result<(), UserError>
+    where
+        T: Unpin,
+    {
+        self.inner
+            .streams
+            .validate_initial_stream_window_size_update(size)?;
+        self.set_initial_window_size(size)
+    }
+
+    pub(crate) fn set_initial_stream_window_size(
+        &mut self,
+        target: WindowSize,
+        advertised: WindowSize,
+    ) where
+        T: Unpin,
+    {
+        self.inner
+            .streams
+            .set_initial_stream_window_size(target, advertised);
     }
 }
 
@@ -646,5 +980,43 @@ where
     fn drop(&mut self) {
         // Ignore errors as this indicates that the mutex is poisoned.
         let _ = self.inner.streams.recv_eof(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_data_frame_budget_scales_with_connection_window() {
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(None),
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(DEFAULT_INITIAL_WINDOW_SIZE)),
+            DEFAULT_INITIAL_WINDOW_SIZE as usize / 2
+        );
+        assert_eq!(DataFrameBudget::Auto.resolve(Some(1024 * 1024)), 512 * 1024);
+    }
+
+    #[test]
+    fn auto_data_frame_budget_has_minimum() {
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(1)),
+            DEFAULT_DATA_FRAME_BUDGET
+        );
+        assert_eq!(
+            DataFrameBudget::Auto.resolve(Some(MAX_WINDOW_SIZE)),
+            MAX_WINDOW_SIZE as usize / 2
+        );
+    }
+
+    #[test]
+    fn configured_data_frame_budget_is_unchanged() {
+        assert_eq!(
+            DataFrameBudget::Configured(123).resolve(Some(MAX_WINDOW_SIZE)),
+            123
+        );
     }
 }

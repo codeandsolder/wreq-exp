@@ -1,6 +1,7 @@
 mod buffer;
 mod counts;
 mod flow_control;
+mod headers_priority;
 mod prioritize;
 mod recv;
 mod send;
@@ -11,14 +12,16 @@ mod stream;
 mod streams;
 mod sync;
 
+pub(crate) use self::headers_priority::HeadersPriorityPolicy;
 pub(crate) use self::prioritize::Prioritized;
 pub(crate) use self::recv::Open;
 pub(crate) use self::send::PollReset;
-pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, StreamRef, Streams};
+pub(crate) use self::streams::{DynStreams, OpaqueStreamRef, RecvOutcome, StreamRef, Streams};
 
 use self::buffer::Buffer;
 use self::counts::Counts;
 use self::flow_control::FlowControl;
+use self::headers_priority::{ChainLink, ChainParents};
 use self::prioritize::Prioritize;
 use self::recv::Recv;
 use self::send::Send;
@@ -26,11 +29,17 @@ use self::state::State;
 use self::store::Store;
 use self::stream::Stream;
 
-use crate::frame::{Priorities, PseudoOrder, StreamDependency, StreamId, StreamIdOverflow};
+use crate::frame::{PseudoOrder, StreamId, StreamIdOverflow};
 use crate::proto::*;
 
 use bytes::Bytes;
 use std::time::Duration;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum BufferStatus {
+    Complete,
+    CodecFull,
+}
 
 #[derive(Debug)]
 pub struct Config {
@@ -74,14 +83,14 @@ pub struct Config {
     /// When this gets exceeded, we issue GOAWAYs.
     pub local_max_error_reset_streams: Option<usize>,
 
-    /// Priority of the headers stream
-    pub headers_stream_dependency: Option<StreamDependency>,
+    /// Connection-level budget policy for DATA framing overhead.
+    pub(crate) data_frame_budget: DataFrameBudget,
+
+    /// Connection-level request `HEADERS` priority rules.
+    pub headers_priority_policy: HeadersPriorityPolicy,
 
     /// Pseudo order of the headers stream
     pub headers_pseudo_order: Option<PseudoOrder>,
-
-    /// Priorities stream
-    pub priorities: Option<Priorities>,
 }
 
 trait DebugStructExt<'a, 'b> {
@@ -104,11 +113,7 @@ trait DebugStructExt<'a, 'b> {
 
 impl<'a, 'b> DebugStructExt<'a, 'b> for std::fmt::DebugStruct<'a, 'b> {
     fn h2_field_if(&mut self, name: &str, val: &bool) -> &mut std::fmt::DebugStruct<'a, 'b> {
-        if *val {
-            self.field(name, val)
-        } else {
-            self
-        }
+        if *val { self.field(name, val) } else { self }
     }
 
     fn h2_field_if_then<T: std::fmt::Debug>(
@@ -117,11 +122,7 @@ impl<'a, 'b> DebugStructExt<'a, 'b> for std::fmt::DebugStruct<'a, 'b> {
         cond: bool,
         val: &T,
     ) -> &mut std::fmt::DebugStruct<'a, 'b> {
-        if cond {
-            self.field(name, val)
-        } else {
-            self
-        }
+        if cond { self.field(name, val) } else { self }
     }
 
     fn h2_field_some<T: std::fmt::Debug>(
