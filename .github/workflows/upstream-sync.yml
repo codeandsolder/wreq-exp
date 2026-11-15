@@ -22,6 +22,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+      - name: Verify upstream reconciliation scenarios
+        run: bash .github/scripts/test-upstream-sync.sh
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -34,8 +36,6 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - name: Verify upstream reconciliation scenarios
-        run: bash .github/scripts/test-upstream-sync.sh
       - name: Sync upstream or open a reconciliation PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
