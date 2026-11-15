@@ -65,9 +65,20 @@ open_reconciliation_pr() {
 if ! git merge --no-ff --no-edit upstream/main >"$LOG" 2>&1; then
   conflict_files="$(git diff --name-only --diff-filter=U || true)"
   if [[ -z "$conflict_files" ]]; then
-    echo "Merge failed without unresolved paths" >&2
-    cat "$LOG" >&2
-    exit 1
+    # Unrelated or rewritten upstream history can fail before Git records any
+    # conflicted paths. Open an explicit manual-work PR rather than silently
+    # dropping either history or treating the problem as a successful sync.
+    git merge --abort >/dev/null 2>&1 || true
+    mkdir -p .github/upstream-reconciliation
+    {
+      printf '# Upstream history requires manual reconciliation\n\n'
+      printf 'Fork base: %s\n\nUpstream commit: %s\n\n' "$base_sha" "$upstream_sha"
+      printf 'Remove this marker after reconciling histories and passing CI.\n'
+    } > .github/upstream-reconciliation/UNMERGEABLE.md
+    git add .github/upstream-reconciliation/UNMERGEABLE.md
+    git commit -m 'Record upstream history that cannot be merged automatically' >>"$LOG" 2>&1
+    open_reconciliation_pr 'Upstream merge failed before creating conflict entries'
+    exit 0
   fi
   git merge --abort
 
@@ -79,8 +90,23 @@ if ! git merge --no-ff --no-edit upstream/main >"$LOG" 2>&1; then
       exit 1
     fi
 
-    # -X ours does not handle modify/delete, rename/delete, or D/F conflicts.
-    # Retain the fork's version of each still-unmerged path, including deletions.
+    # Git relocates a fork file to PATH~HEAD when the upstream side has a
+    # directory at PATH. Restoring only the unmerged placeholder would delete
+    # the fork's original file. Remove the colliding upstream subtree first,
+    # then put the fork's original PATH back into the candidate tree.
+    while IFS= read -r path; do
+      if [[ "$path" == *'~HEAD'* ]]; then
+        original="${path%%~HEAD*}"
+        if [[ -n "$original" ]] && git cat-file -e "HEAD:$original" 2>/dev/null; then
+          git rm -r -f --ignore-unmatch -- "$original"
+          git rm -f --ignore-unmatch -- "$path"
+          git restore --source=HEAD --staged --worktree -- "$original"
+        fi
+      fi
+    done <<< "$conflict_files"
+
+    # -X ours also leaves modify/delete, rename/delete and other unmerged
+    # paths. Retain the fork's version of each, including its deletions.
     while IFS= read -r -d '' path; do
       if git cat-file -e "HEAD:$path" 2>/dev/null; then
         git restore --source=HEAD --staged --worktree -- "$path"
