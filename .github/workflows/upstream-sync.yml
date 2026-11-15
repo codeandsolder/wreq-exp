@@ -34,6 +34,8 @@ jobs:
         with:
           go-version: stable
           cache: false
+      - name: Verify upstream reconciliation scenarios
+        run: bash .github/scripts/test-upstream-sync.sh
       - name: Sync upstream or open a reconciliation PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

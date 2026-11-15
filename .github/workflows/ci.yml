@@ -32,6 +32,8 @@ jobs:
           toolchain: 1.99.0
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Verify upstream reconciliation scenarios
+        run: bash .github/scripts/test-upstream-sync.sh
       - name: Format fork package
         run: cargo +nightly fmt -p wreq -- --check
       - name: Clippy default library
