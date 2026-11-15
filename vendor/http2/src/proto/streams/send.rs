@@ -1,10 +1,10 @@
 use super::{
-    store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
-    StreamIdOverflow, WindowSize,
+    Buffer, BufferStatus, Codec, Config, Counts, Frame, Prioritize, Prioritized, Recv, Store,
+    Stream, StreamId, StreamIdOverflow, WindowSize, store, stream,
 };
 use crate::codec::UserError;
-use crate::frame::{self, Priorities, Reason};
-use crate::proto::{self, Error, Initiator};
+use crate::frame::{self, Reason};
+use crate::proto::{self, Error, Initiator, PrefacePing};
 use crate::tracing;
 
 use bytes::Buf;
@@ -88,11 +88,11 @@ impl Send {
         {
             tracing::debug!("illegal connection-specific headers found");
             return Err(UserError::MalformedHeaders);
-        } else if let Some(te) = fields.get(http::header::TE) {
-            if te != "trailers" {
-                tracing::debug!("illegal connection-specific headers found");
-                return Err(UserError::MalformedHeaders);
-            }
+        } else if let Some(te) = fields.get(http::header::TE)
+            && te != "trailers"
+        {
+            tracing::debug!("illegal connection-specific headers found");
+            return Err(UserError::MalformedHeaders);
         }
         Ok(())
     }
@@ -131,64 +131,36 @@ impl Send {
         counts: &mut Counts,
         task: &mut Option<Waker>,
     ) -> Result<(), UserError> {
-        self.send_priority_and_headers(None, frame, buffer, stream, counts, task)
-    }
+        tracing::trace!(
+            "send_headers; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
 
-    pub fn send_priority_and_headers<B>(
-        &mut self,
-        priority_frame: Option<Priorities>,
-        headers_frame: frame::Headers,
-        buffer: &mut Buffer<Frame<B>>,
-        stream: &mut store::Ptr,
-        counts: &mut Counts,
-        task: &mut Option<Waker>,
-    ) -> Result<(), UserError> {
-        Self::check_headers(headers_frame.fields())?;
+        Self::check_headers(frame.fields())?;
 
-        let end_stream = headers_frame.is_end_stream();
+        let end_stream = frame.is_end_stream();
 
         // Update the state
         stream.state.send_open(end_stream)?;
 
         let mut pending_open = false;
-        if counts.peer().is_local_init(headers_frame.stream_id()) && !stream.is_pending_push {
+        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
             self.prioritize.queue_open(stream);
             pending_open = true;
         }
-
-        // Queue the priority frame if it exists
-        if let Some(priority_frames) = priority_frame {
-            for priority_frame in priority_frames {
-                tracing::trace!(
-                    "send_priority; frame={:?}; init_window={:?}",
-                    priority_frame,
-                    self.init_window_sz
-                );
-
-                self.prioritize
-                    .queue_frame(priority_frame.into(), buffer, stream, task);
-            }
-        }
-
-        tracing::trace!(
-            "send_headers; frame={:?}; init_window={:?}",
-            headers_frame,
-            self.init_window_sz
-        );
 
         // Queue the frame for sending
         //
         // This call expects that, since new streams are in the open queue, new
         // streams won't be pushed on pending_send.
         self.prioritize
-            .queue_frame(headers_frame.into(), buffer, stream, task);
+            .queue_frame(frame.into(), buffer, stream, task);
 
         // Need to notify the connection when pushing onto pending_open since
         // queue_frame only notifies for pending_send.
-        if pending_open {
-            if let Some(task) = task.take() {
-                task.wake();
-            }
+        if pending_open && let Some(task) = task.take() {
+            task.wake();
         }
 
         Ok(())
@@ -213,10 +185,14 @@ impl Send {
         // Validate headers
         Self::check_headers(frame.fields())?;
 
-        debug_assert!(frame.is_informational(),
-            "Frame must be informational (1xx status code) at this point. Validation should happen at the public API boundary.");
-        debug_assert!(!frame.is_end_stream(),
-            "Informational frames must not have end_stream flag set. Validation should happen at the internal send informational header streams.");
+        debug_assert!(
+            frame.is_informational(),
+            "Frame must be informational (1xx status code) at this point. Validation should happen at the public API boundary."
+        );
+        debug_assert!(
+            !frame.is_end_stream(),
+            "Informational frames must not have end_stream flag set. Validation should happen at the internal send informational header streams."
+        );
 
         // Queue the frame for sending WITHOUT changing stream state
         // This is the key difference from send_headers - we don't call stream.state.send_open()
@@ -268,6 +244,18 @@ impl Send {
         // Transition the state to reset no matter what.
         stream.set_reset(reason, initiator);
 
+        if stream.initial_window == Some(stream::InitialWindow::Pending) {
+            // No request bytes have entered the codec. Leave the peer's stream
+            // idle instead of opening it just to cancel it (RFC 9113 §5.1).
+            // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1
+            self.prioritize.clear_queue(buffer, stream);
+            self.prioritize.reclaim_all_capacity(stream, counts);
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+            return;
+        }
+
         // If closed AND the send queue is flushed, then the stream cannot be
         // reset explicitly, either. Implicit resets can still be queued.
         if is_closed && is_empty {
@@ -286,14 +274,22 @@ impl Send {
         // on idle streams and §6.4 says RST_STREAM on idle is a PROTOCOL_ERROR.
         // Keep the queued HEADERS so the stream opens, then send the reset
         // immediately after.
-        if !stream.is_pending_open {
-            // Otherwise, drop any buffered DATA/HEADERS and only send the
-            // reset.
-            //
-            // Note that we don't call `self.recv_err` because we want to enqueue
-            // the reset frame before transitioning the stream inside
-            // `reclaim_all_capacity`.
-            self.prioritize.clear_queue(buffer, stream);
+        // https://www.rfc-editor.org/rfc/rfc9113.html#section-5.1
+        let headers = if stream.is_pending_open {
+            stream.pending_send.pop_front(buffer)
+        } else {
+            None
+        };
+
+        // Drop everything else, including DATA that flow control could hold
+        // ahead of the reset indefinitely.
+        //
+        // Note that we don't call `self.recv_err` because we want to enqueue
+        // the reset frame before transitioning the stream inside
+        // `reclaim_all_capacity`.
+        self.prioritize.clear_queue(buffer, stream);
+        if let Some(headers) = headers {
+            stream.pending_send.push_front(buffer, headers);
         }
 
         let frame = frame::Reset::new(stream.id, reason);
@@ -320,6 +316,12 @@ impl Send {
 
         self.prioritize.reclaim_reserved_capacity(stream, counts);
         self.prioritize.schedule_send(stream, task);
+        if stream.initial_window == Some(stream::InitialWindow::Pending) {
+            // Unopened requests can now be discarded without a stream slot.
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
     }
 
     pub fn send_data<B>(
@@ -345,6 +347,16 @@ impl Send {
         counts: &mut Counts,
         task: &mut Option<Waker>,
     ) -> Result<(), UserError> {
+        // Trailers are carried in a HEADERS frame and are therefore subject to the
+        // same prohibition on connection-specific header fields (RFC 9113 §8.2.2)
+        // as any other outbound HEADERS block. `send_headers`, `send_push_promise`
+        // and `send_interim_informational_headers` all validate this, and the
+        // receive path treats such a header as malformed. Validate here too so a
+        // caller cannot make this crate *generate* a message §8.2.2 forbids.
+        // Checked before the state transition so a rejected call leaves the stream
+        // untouched and still able to send valid trailers.
+        Self::check_headers(frame.fields())?;
+
         // TODO: Should this logic be moved into state.rs?
         if !stream.state.is_send_streaming() {
             return Err(UserError::UnexpectedFrameType);
@@ -362,20 +374,33 @@ impl Send {
         Ok(())
     }
 
-    pub fn poll_complete<T, B>(
+    pub fn buffer_pending<T, B>(
         &mut self,
-        cx: &mut Context,
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
+        recv: &mut Recv,
         dst: &mut Codec<T, Prioritized<B>>,
-    ) -> Poll<io::Result<()>>
+        preface_ping: Option<&mut PrefacePing>,
+    ) -> io::Result<BufferStatus>
     where
         T: AsyncWrite + Unpin,
         B: Buf,
     {
         self.prioritize
-            .poll_complete(cx, buffer, store, counts, dst)
+            .buffer_pending(buffer, store, counts, recv, dst, preface_ping)
+    }
+
+    pub fn reclaim_written_frame<T, B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> bool
+    where
+        B: Buf,
+    {
+        self.prioritize.reclaim_written_frame(buffer, store, dst)
     }
 
     /// Request capacity to send data
@@ -633,11 +658,15 @@ impl Send {
         self.prioritize.clear_pending_open(store, counts);
     }
 
+    pub fn has_pending_open(&self, store: &Store) -> bool {
+        self.prioritize.has_pending_open(store)
+    }
+
     pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
-        if let Ok(next) = self.next_stream_id {
-            if id >= next {
-                return Err(Reason::PROTOCOL_ERROR);
-            }
+        if let Ok(next) = self.next_stream_id
+            && id >= next
+        {
+            return Err(Reason::PROTOCOL_ERROR);
         }
         // if next_stream_id is overflowed, that's ok.
 

@@ -6,8 +6,8 @@ use std::{
 };
 
 use http::Response;
+use netty::rt::Sleep;
 use pin_project_lite::pin_project;
-use wreq_proto::rt::Sleep;
 
 use super::body::TimeoutBody;
 use crate::{
@@ -45,8 +45,8 @@ where
             return Poll::Ready(Err(Error::request(TimedOut).into()));
         }
 
-        // Before headers arrive, the read timer limits that wait. The body starts
-        // and resets its own read timer after each successful frame.
+        // Before headers arrive, the read timer limits that wait. The body rearms
+        // the timer when each frame read begins.
         if let Some(timeout) = this.read_timeout_fut.as_mut()
             && timeout.as_mut().poll(cx).is_ready()
         {

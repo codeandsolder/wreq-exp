@@ -56,6 +56,15 @@ where
 
         Codec { inner }
     }
+
+    /// Buffers the fixed 24-byte client magic before the first encoded frame.
+    ///
+    /// The initial SETTINGS frame that follows completes the client connection
+    /// preface described in RFC 9113 section 3.4.
+    /// https://www.rfc-editor.org/rfc/rfc9113.html#section-3.4
+    pub(crate) fn buffer_client_magic(&mut self, client_magic: &[u8]) {
+        self.inner.get_mut().buffer_client_magic(client_magic);
+    }
 }
 
 impl<T, B> Codec<T, B> {
@@ -88,6 +97,49 @@ impl<T, B> Codec<T, B> {
     /// Set the peer's max frame size.
     pub fn set_max_send_frame_size(&mut self, val: usize) {
         self.framed_write().set_max_frame_size(val)
+    }
+
+    /// Returns the max DATA payload size if a local cap was set.
+    pub(crate) fn max_send_data_frame_size(&self) -> Option<usize> {
+        self.inner.get_ref().max_data_frame_size()
+    }
+
+    /// Caps DATA payloads sent to the peer; its max frame size still applies.
+    pub(crate) fn set_max_send_data_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_data_frame_size(val)
+    }
+
+    /// Caps HEADERS, PUSH_PROMISE and CONTINUATION payloads sent to the peer.
+    pub(crate) fn set_max_send_header_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_header_frame_size(val)
+    }
+
+    /// Sets the bytes of frames gathered for one write while DATA frames are
+    /// coalesced.
+    pub(crate) fn set_max_write_buffer_size(&mut self, val: usize) {
+        self.framed_write().set_max_write_buffer_size(val)
+    }
+
+    /// Replaces a grown write buffer with nothing left to write by a default
+    /// one, if `idle`.
+    pub(crate) fn release_write_buffer(&mut self, idle: impl FnOnce() -> bool) {
+        self.framed_write().release_write_buffer(idle)
+    }
+
+    /// Gives each sent frame a write of its own after the initial write.
+    pub(crate) fn set_one_frame_per_write(&mut self) {
+        self.framed_write().set_one_frame_per_write()
+    }
+
+    /// Starts writing each frame alone, if set.
+    pub(crate) fn start_one_frame_per_write(&mut self) {
+        self.framed_write().start_one_frame_per_write()
+    }
+
+    /// Returns the max parts of a DATA frame coalesced from queued chunks, or
+    /// `None` if queued DATA is not coalesced.
+    pub(crate) fn max_send_data_frame_parts(&self) -> Option<usize> {
+        self.inner.get_ref().max_data_frame_parts()
     }
 
     /// Set the peer's header table size size.
@@ -124,6 +176,12 @@ impl<T, B> Codec<T, B> {
     fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
         self.inner.get_mut()
     }
+
+    /// Returns whether any bytes were read from the socket since the last
+    /// call, including bytes of frames that are partial or ignored.
+    pub(crate) fn take_read_activity(&mut self) -> bool {
+        self.framed_write().take_read_activity()
+    }
 }
 
 impl<T, B> Codec<T, B>
@@ -136,14 +194,25 @@ where
         self.framed_write().poll_ready(cx)
     }
 
+    /// Returns whether the codec can buffer a frame without flushing the
+    /// underlying I/O object.
+    pub(crate) fn has_send_capacity(&mut self) -> bool {
+        self.framed_write().has_capacity()
+    }
+
     /// Buffer a frame.
     ///
-    /// `poll_ready` must be called first to ensure that a frame may be
-    /// accepted.
+    /// `poll_ready` or `poll_send_capacity` must be called first to ensure
+    /// that a frame may be accepted.
     ///
     /// TODO: Rename this to avoid conflicts with Sink::buffer
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
         self.framed_write().buffer(item)
+    }
+
+    /// Writes encoded bytes without flushing the upstream writer.
+    pub(crate) fn poll_write_buffered(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_write_buffered(cx)
     }
 
     /// Flush buffered data to the wire
@@ -154,6 +223,19 @@ where
     /// Shutdown the send half
     pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().shutdown(cx)
+    }
+
+    /// Returns `Ready` when the codec can buffer a connection control frame.
+    ///
+    /// Unlike `poll_ready`, this does not wait for the upstream flush.
+    pub(crate) fn poll_send_capacity(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_capacity(cx)
+    }
+
+    /// Returns whether the codec can still buffer a frame after `len` more
+    /// bytes are buffered.
+    pub(crate) fn has_send_capacity_after(&mut self, len: usize) -> bool {
+        self.framed_write().has_capacity_after(len)
     }
 }
 

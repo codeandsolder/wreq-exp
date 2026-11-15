@@ -75,33 +75,23 @@ impl Http2Info {
         self.peer_acknowledged_local_initial_settings
     }
 
-    pub(crate) fn from_settings(
-        local: &[http2::frame::ObservedSetting],
-        peer: Option<&http2::frame::Settings>,
-        peer_first_connection_window_update: Option<(u32, bool)>,
-        peer_acknowledged_local_initial_settings: bool,
-    ) -> Self {
-        let local_initial_settings = local
-            .iter()
-            .map(|setting| Http2Setting {
-                id: setting.id(),
-                value: setting.value(),
-            })
+    pub(crate) fn from_observation(observation: netty::conn::http2::Http2Observation) -> Self {
+        let local_initial_settings = observation
+            .local_settings
+            .into_iter()
+            .map(|(id, value)| Http2Setting { id, value })
             .collect();
-        let peer_initial_settings_received = peer.is_some();
-        let peer_initial_settings = peer
-            .and_then(http2::frame::Settings::observed_settings)
-            .unwrap_or_default()
-            .iter()
-            .map(|setting| Http2Setting {
-                id: setting.id(),
-                value: setting.value(),
-            })
+        let peer_initial_settings_received = observation.peer_settings_received;
+        let peer_initial_settings = observation
+            .peer_settings
+            .into_iter()
+            .map(|(id, value)| Http2Setting { id, value })
             .collect();
         let (
             peer_first_connection_window_update,
             peer_first_connection_window_update_before_settings_ack,
-        ) = peer_first_connection_window_update
+        ) = observation
+            .first_connection_window_update
             .map(|(increment, before_ack)| (Some(increment), Some(before_ack)))
             .unwrap_or((None, None));
         Self {
@@ -110,7 +100,7 @@ impl Http2Info {
             peer_initial_settings,
             peer_first_connection_window_update,
             peer_first_connection_window_update_before_settings_ack,
-            peer_acknowledged_local_initial_settings,
+            peer_acknowledged_local_initial_settings: observation.peer_settings_ack_received,
         }
     }
 }

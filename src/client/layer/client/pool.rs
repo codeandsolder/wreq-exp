@@ -14,8 +14,8 @@ use std::{
 };
 
 use lru::LruCache;
+use netty::rt::{Executor as _, Timer as _};
 use tokio::sync::oneshot;
-use wreq_proto::rt::{Executor as _, Timer as _};
 
 use crate::{
     rt::{Executor, Timer},
@@ -63,6 +63,8 @@ pub enum Reservation<T> {
     /// This connection could be used multiple times, the first one will be
     /// reinserted into the `idle` pool, and the second will be given to
     /// the `Checkout`.
+    // Only HTTP/2 connections are shared.
+    #[cfg_attr(not(feature = "http2"), allow(dead_code))]
     Shared(T, T),
     /// This connection requires unique access. It will be returned after
     /// use is complete.
@@ -145,6 +147,12 @@ impl<T, K: Key> Pool<T, K> {
 impl<T: Poolable, K: Key> Pool<T, K> {
     /// Returns a `Checkout` which is a future that resolves if an idle
     /// connection becomes available.
+    /// Takes an idle connection for `key` if one is ready now, without waiting for one.
+    pub fn try_checkout(&self, key: &K) -> Option<Pooled<T, K>> {
+        let value = self.inner.as_ref()?.lock().take_idle(key)?;
+        Some(self.reuse(key, value))
+    }
+
     pub fn checkout(&self, key: K) -> Checkout<T, K> {
         Checkout {
             key,
@@ -299,6 +307,35 @@ impl<'a, T: Poolable + 'a, K: Debug> IdlePopper<'a, T, K> {
 impl<T: Poolable, K: Key> PoolInner<T, K> {
     fn now(&self) -> Instant {
         self.timer.now()
+    }
+
+    /// Takes an idle connection for `key` that is still open and has not expired.
+    fn take_idle(&mut self, key: &K) -> Option<T> {
+        let expiration = Expiration::new(self.timeout);
+        let now = self.now();
+        let maybe_entry = self.idle.get_mut(key).and_then(|list| {
+            trace!("take? {:?}: expiration = {:?}", key, expiration.0);
+            // A block to end the mutable borrow on list,
+            // so the map below can check is_empty()
+            {
+                let popper = IdlePopper { key, list };
+                popper.pop(&expiration, now)
+            }
+            .map(|e| (e, list.is_empty()))
+        });
+
+        let (entry, empty) = if let Some((e, empty)) = maybe_entry {
+            (Some(e), empty)
+        } else {
+            // No entry found means nuke the list for sure.
+            (None, true)
+        };
+
+        if empty {
+            self.idle.pop(key);
+        }
+
+        entry.map(|e| e.value)
     }
 
     fn put(&mut self, key: &K, value: T, __pool_ref: &Arc<Mutex<PoolInner<T, K>>>) {
@@ -622,32 +659,7 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
     fn checkout(&mut self, cx: &mut task::Context<'_>) -> Option<Pooled<T, K>> {
         let entry = {
             let mut inner = self.pool.inner.as_ref()?.lock();
-            let expiration = Expiration::new(inner.timeout);
-            let now = inner.now();
-            let maybe_entry = inner.idle.get_mut(&self.key).and_then(|list| {
-                trace!("take? {:?}: expiration = {:?}", self.key, expiration.0);
-                // A block to end the mutable borrow on list,
-                // so the map below can check is_empty()
-                {
-                    let popper = IdlePopper {
-                        key: &self.key,
-                        list,
-                    };
-                    popper.pop(&expiration, now)
-                }
-                .map(|e| (e, list.is_empty()))
-            });
-
-            let (entry, empty) = if let Some((e, empty)) = maybe_entry {
-                (Some(e), empty)
-            } else {
-                // No entry found means nuke the list for sure.
-                (None, true)
-            };
-
-            if empty {
-                inner.idle.pop(&self.key);
-            }
+            let entry = inner.take_idle(&self.key);
 
             if entry.is_none() && self.waiter.is_none() {
                 let (tx, mut rx) = oneshot::channel();
@@ -666,7 +678,7 @@ impl<T: Poolable, K: Key> Checkout<T, K> {
             entry
         };
 
-        entry.map(|e| self.pool.reuse(&self.key, e.value))
+        entry.map(|value| self.pool.reuse(&self.key, value))
     }
 }
 
@@ -707,6 +719,7 @@ pub struct Connecting<T: Poolable, K: Key> {
 }
 
 impl<T: Poolable, K: Key> Connecting<T, K> {
+    #[cfg(feature = "http2")]
     pub fn alpn_h2(self, pool: &Pool<T, K>) -> Option<Self> {
         debug_assert!(
             self.pool.0.is_none(),

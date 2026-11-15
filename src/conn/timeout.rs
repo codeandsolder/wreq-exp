@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
+use netty::rt::{Sleep, Timer as _};
 use pin_project_lite::pin_project;
 use tower::{BoxError, Layer, Service};
-use wreq_proto::rt::{Sleep, Timer as _};
 
 use crate::{error::TimedOut, rt::Timer};
 
@@ -127,7 +127,7 @@ mod tests {
 
     struct ReadySleep;
 
-    impl wreq_proto::rt::Timer for ReadyTimer {
+    impl netty::rt::Timer for ReadyTimer {
         fn sleep(&self, _duration: Duration) -> Pin<Box<dyn Sleep>> {
             Box::pin(ReadySleep)
         }
@@ -155,7 +155,7 @@ mod tests {
             TimeoutLayer::new(Timer::new(ReadyTimer), Some(Duration::from_millis(50)))
                 .layer(tower::service_fn(|()| pending::<Result<(), BoxError>>()));
 
-        let mut future = Box::pin(service.call(()));
+        let mut future = std::pin::pin!(service.call(()));
         let mut cx = Context::from_waker(Waker::noop());
         let Poll::Ready(Err(error)) = future.as_mut().poll(&mut cx) else {
             panic!("connect timeout did not complete");

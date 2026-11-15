@@ -18,6 +18,7 @@ use futures_util::{Sink, SinkExt, Stream, StreamExt, stream::FusedStream};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version, header, uri::Scheme,
 };
+#[cfg(feature = "http2")]
 use http2::ext::Protocol;
 use pin_project_lite::pin_project;
 use tokio_tungstenite::tungstenite::{
@@ -84,6 +85,8 @@ impl WebSocketRequestBuilder {
     /// - Widely supported by servers
     ///
     /// # HTTP/2
+    ///
+    /// Requires the `http2` feature; otherwise the handshake fails with an unsupported version.
     ///
     /// - Uses the Extended CONNECT Protocol (RFC 8441)
     /// - Sends a `CONNECT` request with the `:protocol: websocket` pseudo-header instead of the
@@ -275,6 +278,8 @@ impl WebSocketRequestBuilder {
     /// overwritten if the same key is used. The key will simply show up
     /// twice in the query string.
     /// Calling `.query(&[("foo", "a"), ("foo", "b")])` gives `"foo=a&foo=b"`.
+    /// The URI is normalized according to the [URL Standard](https://url.spec.whatwg.org/)
+    /// when parameters are appended.
     ///
     /// # Note
     /// This method does not support serializing a single key-value
@@ -283,8 +288,8 @@ impl WebSocketRequestBuilder {
     /// and maps into a key-value pair.
     ///
     /// # Errors
-    /// This method will fail if the object you provide cannot be serialized
-    /// into a query string.
+    /// This method fails if the URI cannot be parsed as a URL, the parameters
+    /// cannot be serialized, or the resulting URI is invalid.
     #[inline]
     #[cfg(feature = "query")]
     #[cfg_attr(docsrs, doc(cfg(feature = "query")))]
@@ -451,6 +456,7 @@ impl WebSocketRequestBuilder {
                 *request.version_mut() = Some(Version::HTTP_11);
                 Some(nonce)
             }
+            #[cfg(feature = "http2")]
             Some(Version::HTTP_2) => {
                 *request.method_mut() = Method::CONNECT;
                 *request.version_mut() = Some(Version::HTTP_2);
@@ -754,7 +760,7 @@ impl Stream for WebSocket {
                         return Poll::Ready(Some(Ok(msg)));
                     }
                 }
-                Some(Err(err)) => return Poll::Ready(Some(Err(Error::body(err)))),
+                Some(Err(err)) => return Poll::Ready(Some(Err(Error::websocket(err)))),
                 None => return Poll::Ready(None),
             }
         }

@@ -85,6 +85,8 @@
     clippy::undocumented_unsafe_blocks
 )]
 #![allow(clippy::type_complexity, clippy::manual_range_contains)]
+// uncomment me to run benchmarks
+//#![cfg_attr(test, feature(test))]
 #![cfg_attr(test, deny(warnings))]
 
 mod tracing;
@@ -131,8 +133,8 @@ pub mod ext;
 pub mod server;
 mod share;
 
+/// Fuzzing entry points, compiled only under `--cfg fuzzing`.
 #[cfg(fuzzing)]
-#[cfg_attr(feature = "unstable", allow(missing_docs))]
 pub mod fuzz_bridge;
 
 pub use crate::error::{Error, Reason};

@@ -1,17 +1,18 @@
-use super::{util, StreamDependency, StreamId};
+use super::{StreamDependency, StreamId, WindowUpdate, util};
 use crate::ext::Protocol;
 use crate::frame::{Error, Frame, Head, Kind};
 use crate::hpack::{self, BytesStr};
 use crate::tracing;
 
 use http::header::{self, HeaderName, HeaderValue};
-use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
+use http::{HeaderMap, Method, Request, StatusCode, Uri, uri};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use smallvec::SmallVec;
 
 use std::fmt;
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 
 type EncodeBuf<'a> = bytes::buf::Limit<&'a mut BytesMut>;
@@ -34,6 +35,10 @@ pub struct Headers {
 
     /// The associated flags
     flags: HeadersFlag,
+
+    /// Client-only one-shot companion encoded as a separate frame after the
+    /// complete initial request header block.
+    initial_stream_window_update: Option<NonZeroU32>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -62,7 +67,11 @@ pub struct Continuation {
     /// Stream ID of continuation frame
     stream_id: StreamId,
 
+    /// The encoding header block fragment
     header_block: EncodingHeaderBlock,
+
+    /// Carries the client-only companion to the final END_HEADERS fragment.
+    initial_stream_window_update: Option<NonZeroU32>,
 }
 
 // TODO: These fields shouldn't be `pub`
@@ -83,31 +92,37 @@ pub struct Pseudo {
 }
 
 define_enum_with_values! {
-    /// Represents the order of HTTP/2 pseudo-header fields in the header block.
+    /// Identifies an HTTP/2 pseudo-header field ([RFC 9113 §8.3]).
     ///
-    /// HTTP/2 pseudo-header fields are a set of predefined header fields that start with ':'.
-    /// The order of these fields in a header block is significant. This enum defines the
-    /// possible pseudo-header fields and their standard order according to RFC 7540.
+    /// The declaration order is the default order of [`PseudoOrder`].
+    ///
+    /// [RFC 9113 §8.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3
     @U8
+    #[non_exhaustive]
     pub enum PseudoId {
+        /// The `:method` pseudo-header.
         Method => 0x0001,
+        /// The `:scheme` pseudo-header.
         Scheme => 0x0002,
+        /// The `:authority` pseudo-header.
         Authority => 0x0003,
+        /// The `:path` pseudo-header.
         Path => 0x0004,
+        /// The `:protocol` pseudo-header.
         Protocol => 0x0005,
+        /// The `:status` pseudo-header.
         Status => 0x0006,
     }
 }
 
-/// Represents the order of HTTP/2 pseudo-header fields in a header block.
+/// The order of pseudo-header fields in outgoing request `HEADERS`.
 ///
-/// This structure maintains an ordered list of pseudo-header fields (such as `:method`, `:scheme`, etc.)
-/// for use when encoding or decoding HTTP/2 header blocks. The order of pseudo-headers is significant
-/// according to the HTTP/2 specification, and this type ensures that the correct order is preserved
-/// and that no duplicates are present.
+/// Set with [`Builder::headers_pseudo_order`](crate::client::Builder::headers_pseudo_order).
+/// Any order is valid, since pseudo-header fields only have to precede regular
+/// fields ([RFC 9113 §8.3]). [`PseudoOrderBuilder`] drops repeats and appends
+/// missing fields in [`PseudoId`] declaration order.
 ///
-/// Typically, a `PseudoOrder` is costructed using the [`PseudoOrderBuilder`] to enforce uniqueness
-/// and protocol-compliant ordering.
+/// [RFC 9113 §8.3]: https://www.rfc-editor.org/rfc/rfc9113.html#section-8.3
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PseudoOrder {
     ids: SmallVec<[PseudoId; PseudoId::DEFAULT_STACK_SIZE]>,
@@ -123,6 +138,7 @@ pub struct PseudoOrderBuilder {
 // ===== impl PseudoOrder =====
 
 impl PseudoOrder {
+    /// Creates a new [`PseudoOrderBuilder`].
     #[inline]
     pub fn builder() -> PseudoOrderBuilder {
         PseudoOrderBuilder {
@@ -154,6 +170,7 @@ impl<'a> IntoIterator for &'a PseudoOrder {
 // ===== impl PseudoOrderBuilder =====
 
 impl PseudoOrderBuilder {
+    /// Appends a pseudo-header, ignoring repeats.
     pub fn push(mut self, id: PseudoId) -> Self {
         let mask_id = id.mask_id();
         if mask_id != 0 {
@@ -167,6 +184,7 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Appends every pseudo-header, ignoring repeats.
     pub fn extend(mut self, iter: impl IntoIterator<Item = PseudoId>) -> Self {
         for id in iter {
             self = self.push(id);
@@ -174,6 +192,7 @@ impl PseudoOrderBuilder {
         self
     }
 
+    /// Finishes the order, appending any pseudo-header not yet listed.
     pub fn build(mut self) -> PseudoOrder {
         if self.ids.len() != PseudoId::DEFAULT_IDS.len() {
             self = self.extend(PseudoId::DEFAULT_IDS);
@@ -196,20 +215,26 @@ struct HeaderBlock {
     /// The decoded header fields
     fields: HeaderMap,
 
-    /// Precomputed size of all of our header fields, for perf reasons
-    field_size: usize,
-
     /// Set to true if decoding went over the max header list size.
     is_over_size: bool,
 
     /// Pseudo headers, these are broken out as they must be sent as part of the
     /// headers frame.
     pseudo: Pseudo,
+
+    /// Uncompressed size of every decoded field, including malformed fields.
+    /// RFC 9113 section 6.5.2 counts the name, value, and 32 bytes of overhead.
+    /// https://www.rfc-editor.org/rfc/rfc9113.html#section-6.5.2
+    decoded_size: usize,
+
+    /// Set when a decoded field makes the HTTP message malformed. HPACK
+    /// decoding still continues so the connection-level table stays in sync.
+    is_malformed: bool,
 }
 
 #[derive(Debug)]
 struct EncodingHeaderBlock {
-    hpack: Bytes,
+    hpack: BytesMut,
 }
 
 const END_STREAM: u8 = 0x1;
@@ -227,16 +252,19 @@ impl Headers {
             stream_id,
             stream_dep: None,
             header_block: HeaderBlock {
-                field_size: calculate_headermap_size(&fields),
+                decoded_size: calculate_header_list_size(&pseudo, &fields),
                 fields,
                 is_over_size: false,
                 pseudo,
+                is_malformed: false,
             },
             flags: HeadersFlag::default(),
+            initial_stream_window_update: None,
         }
     }
 
     pub fn trailers(stream_id: StreamId, fields: HeaderMap) -> Self {
+        let decoded_size = calculate_headermap_size(&fields);
         let mut flags = HeadersFlag::default();
         flags.set_end_stream();
 
@@ -244,12 +272,14 @@ impl Headers {
             stream_id,
             stream_dep: None,
             header_block: HeaderBlock {
-                field_size: calculate_headermap_size(&fields),
                 fields,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                decoded_size,
+                is_malformed: false,
             },
             flags,
+            initial_stream_window_update: None,
         }
     }
 
@@ -259,6 +289,7 @@ impl Headers {
     pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
         let flags = HeadersFlag(head.flag());
         let mut pad = 0;
+        let mut is_malformed = false;
 
         tracing::trace!("loading headers; flags={:?}", flags);
 
@@ -279,17 +310,21 @@ impl Headers {
 
         // Read the stream dependency
         let stream_dep = if flags.is_priority() {
-            if src.len() < 5 {
+            if src.len() < StreamDependency::LEN {
                 return Err(Error::MalformedMessage);
             }
-            let stream_dep = StreamDependency::load(&src[..5])?;
+            let stream_dep = StreamDependency::load(&src[..StreamDependency::LEN])?;
 
-            if stream_dep.dependency_id() == head.stream_id() {
-                return Err(Error::InvalidDependencyId);
+            if stream_dep.dependency_id == head.stream_id() {
+                // RFC 9113 section 4.3 requires decoding the complete field
+                // block before rejecting only this stream, to keep HPACK in sync.
+                // https://www.rfc-editor.org/rfc/rfc9113.html#section-4.3
+                tracing::trace!("invalid HEADERS dependency ID; draining field block");
+                is_malformed = true;
             }
 
-            // Drop the next 5 bytes
-            src.advance(5);
+            // Drop the stream dependency
+            src.advance(StreamDependency::LEN);
 
             Some(stream_dep)
         } else {
@@ -310,11 +345,13 @@ impl Headers {
             stream_dep,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
-                field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                decoded_size: 0,
+                is_malformed,
             },
             flags,
+            initial_stream_window_update: None,
         };
 
         Ok((headers, src))
@@ -366,9 +403,28 @@ impl Headers {
         &self.header_block.pseudo
     }
 
-    // If the stream dependency is set, the PRIORITY flag must be set
+    /// Sets the deprecated priority fields carried by this `HEADERS`
+    /// frame.
+    ///
+    /// This sets the `PRIORITY` flag without changing the frame's existing
+    /// flags. If `stream_dep` refers to this frame's own stream, the frame is
+    /// left unchanged.
+    ///
+    /// [RFC 9113 §5.3.2] retains these fields for interoperability. A
+    /// self-dependency is invalid under [RFC 7540 §5.3.1].
+    ///
+    /// [RFC 7540 §5.3.1]: https://www.rfc-editor.org/rfc/rfc7540.html#section-5.3.1
+    /// [RFC 9113 §5.3.2]: https://www.rfc-editor.org/rfc/rfc9113.html#section-5.3.2
     pub fn set_stream_dependency(&mut self, stream_dep: StreamDependency) {
-        self.flags = HeadersFlag(END_HEADERS | PRIORITY);
+        if stream_dep.dependency_id == self.stream_id {
+            tracing::warn!(
+                "ignoring self-dependent HEADERS priority for stream_id={:?}",
+                self.stream_id
+            );
+            return;
+        }
+
+        self.flags.set_priority();
         self.stream_dep = Some(stream_dep);
     }
 
@@ -386,7 +442,7 @@ impl Headers {
     }
 
     pub fn encode(
-        self,
+        mut self,
         encoder: &mut hpack::Encoder,
         dst: &mut EncodeBuf<'_>,
     ) -> Option<Continuation> {
@@ -396,18 +452,44 @@ impl Headers {
         // Get the HEADERS frame head
         let head = self.head();
 
-        self.header_block
-            .into_encoding(encoder)
-            .encode(head, dst, |dst| {
-                if let Some(ref stream_dep) = self.stream_dep {
-                    // write 5 bytes for the stream dependency
-                    stream_dep.encode(dst);
-                }
-            })
+        let initial_stream_window_update = self.initial_stream_window_update.take();
+
+        let continuation =
+            self.header_block
+                .into_encoding(encoder)
+                .encode(&head, dst, Some(encoder), |dst| {
+                    if let Some(ref stream_dep) = self.stream_dep {
+                        // write 5 bytes for the stream dependency
+                        stream_dep.encode(dst);
+                    }
+                });
+
+        match continuation {
+            Some(mut continuation) => {
+                continuation.initial_stream_window_update = initial_stream_window_update;
+                Some(continuation)
+            }
+            None => {
+                encode_initial_stream_window_update(
+                    self.stream_id,
+                    initial_stream_window_update,
+                    dst,
+                );
+                None
+            }
+        }
     }
 
     fn head(&self) -> Head {
         Head::new(Kind::Headers, self.flags.into(), self.stream_id)
+    }
+
+    pub(crate) fn set_initial_stream_window_update(&mut self, increment: NonZeroU32) {
+        self.initial_stream_window_update = Some(increment);
+    }
+
+    pub(crate) fn is_malformed(&self) -> bool {
+        self.header_block.is_malformed
     }
 }
 
@@ -480,10 +562,11 @@ impl PushPromise {
         PushPromise {
             flags: PushPromiseFlag::default(),
             header_block: HeaderBlock {
-                field_size: calculate_headermap_size(&fields),
+                decoded_size: calculate_header_list_size(&pseudo, &fields),
                 fields,
                 is_over_size: false,
                 pseudo,
+                is_malformed: false,
             },
             promised_id,
             stream_id,
@@ -497,7 +580,7 @@ impl PushPromise {
 
         // A promised request "that indicates the presence of a request body
         // MUST reset the promised stream with a stream error"
-        if let Some(content_length) = req.headers().get(header::CONTENT_LENGTH) {
+        for content_length in req.headers().get_all(header::CONTENT_LENGTH) {
             let parsed_length = parse_u64(content_length.as_bytes());
             if parsed_length != Ok(0) {
                 return Err(InvalidContentLength(parsed_length));
@@ -572,9 +655,10 @@ impl PushPromise {
             flags,
             header_block: HeaderBlock {
                 fields: HeaderMap::new(),
-                field_size: 0,
                 is_over_size: false,
                 pseudo: Pseudo::default(),
+                decoded_size: 0,
+                is_malformed: false,
             },
             promised_id,
             stream_id: head.stream_id(),
@@ -624,7 +708,7 @@ impl PushPromise {
 
         self.header_block
             .into_encoding(encoder)
-            .encode(head, dst, |dst| {
+            .encode(&head, dst, Some(encoder), |dst| {
                 dst.put_u32(promised_id.into());
             })
     }
@@ -636,6 +720,10 @@ impl PushPromise {
     /// Consume `self`, returning the parts of the frame
     pub fn into_parts(self) -> (Pseudo, HeaderMap) {
         (self.header_block.pseudo, self.header_block.fields)
+    }
+
+    pub(crate) fn is_malformed(&self) -> bool {
+        self.header_block.is_malformed
     }
 }
 
@@ -666,9 +754,43 @@ impl Continuation {
     pub fn encode(self, dst: &mut EncodeBuf<'_>) -> Option<Continuation> {
         // Get the CONTINUATION frame head
         let head = self.head();
+        let initial_stream_window_update = self.initial_stream_window_update;
+        let continuation = self.header_block.encode(&head, dst, None, |_| {});
 
-        self.header_block.encode(head, dst, |_| {})
+        match continuation {
+            Some(mut continuation) => {
+                continuation.initial_stream_window_update = initial_stream_window_update;
+                Some(continuation)
+            }
+            None => {
+                encode_initial_stream_window_update(
+                    self.stream_id,
+                    initial_stream_window_update,
+                    dst,
+                );
+                None
+            }
+        }
     }
+}
+
+fn encode_initial_stream_window_update(
+    stream_id: StreamId,
+    increment: Option<NonZeroU32>,
+    dst: &mut EncodeBuf<'_>,
+) {
+    let Some(increment) = increment else {
+        return;
+    };
+
+    // RFC 9113 §6.10 forbids interleaving another frame inside a header
+    // block. This runs only after END_HEADERS has been encoded. The Limit is
+    // scoped to the header fragment, so append the separate WINDOW_UPDATE to
+    // its underlying buffer rather than counting it as header payload.
+    // https://www.rfc-editor.org/rfc/rfc9113.html#section-6.10
+    let update = WindowUpdate::new(stream_id, increment.get());
+    tracing::debug!(frame = ?update, "send");
+    update.encode(&mut **dst.get_mut());
 }
 
 // ===== impl Pseudo =====
@@ -761,15 +883,20 @@ impl Pseudo {
 
     /// Whether it has status 1xx
     pub(crate) fn is_informational(&self) -> bool {
-        self.status
-            .map_or(false, |status| status.is_informational())
+        self.status.is_some_and(|status| status.is_informational())
     }
 }
 
 // ===== impl EncodingHeaderBlock =====
 
 impl EncodingHeaderBlock {
-    fn encode<F>(mut self, head: Head, dst: &mut EncodeBuf<'_>, f: F) -> Option<Continuation>
+    fn encode<F>(
+        mut self,
+        head: &Head,
+        dst: &mut EncodeBuf<'_>,
+        encoder: Option<&mut hpack::Encoder>,
+        f: F,
+    ) -> Option<Continuation>
     where
         F: FnOnce(&mut EncodeBuf<'_>),
     {
@@ -786,14 +913,21 @@ impl EncodingHeaderBlock {
 
         // Now, encode the header payload
         let continuation = if self.hpack.len() > dst.remaining_mut() {
-            dst.put((&mut self.hpack).take(dst.remaining_mut()));
+            let head_part = self.hpack.split_to(dst.remaining_mut());
+            dst.put_slice(&head_part);
 
             Some(Continuation {
                 stream_id: head.stream_id(),
                 header_block: self,
+                initial_stream_window_update: None,
             })
         } else {
             dst.put_slice(&self.hpack);
+            // The block is fully written, so the buffer can be reused by the
+            // next frame on this connection.
+            if let Some(encoder) = encoder {
+                encoder.return_scratch(self.hpack);
+            }
 
             None
         };
@@ -898,6 +1032,10 @@ impl HeadersFlag {
         self.0 |= END_HEADERS;
     }
 
+    fn set_priority(&mut self) {
+        self.0 |= PRIORITY;
+    }
+
     pub fn is_padded(&self) -> bool {
         self.0 & PADDED == PADDED
     }
@@ -987,20 +1125,19 @@ impl HeaderBlock {
         decoder: &mut hpack::Decoder,
     ) -> Result<(), Error> {
         let mut reg = !self.fields.is_empty();
-        let mut malformed = false;
+        let mut malformed = self.is_malformed;
         let mut header_list_way_too_large = false;
-        let mut headers_size = self.calculate_header_list_size();
         let max_header_list_abuse_size =
             max_header_list_size.saturating_mul(MAX_HEADER_LIST_ABUSE_MULTIPLIER);
 
         macro_rules! check_size {
             () => {{
-                if headers_size > max_header_list_abuse_size {
+                if self.decoded_size > max_header_list_abuse_size {
                     tracing::trace!("load_hpack; header list size over abuse max");
                     header_list_way_too_large = true;
                     ControlFlow::Break(())
                 } else {
-                    if headers_size >= max_header_list_size && !self.is_over_size {
+                    if self.decoded_size >= max_header_list_size && !self.is_over_size {
                         tracing::trace!("load_hpack; header list size over max");
                         self.is_over_size = true;
                     }
@@ -1019,11 +1156,6 @@ impl HeaderBlock {
                     malformed = true;
                 } else {
                     let __val = $val;
-                    headers_size +=
-                        decoded_header_size(stringify!($field).len() + 1, __val.as_str().len());
-                    if check_size!().is_break() {
-                        return ControlFlow::Break(());
-                    }
                     if !self.is_over_size {
                         self.pseudo.$field = Some(__val);
                     }
@@ -1037,7 +1169,25 @@ impl HeaderBlock {
         // the headers. A malformed header frame is a stream level error, but
         // the hpack state is connection level. In order to maintain correct
         // state for other streams, the hpack decoding process must complete.
-        let res = decoder.decode(&mut cursor, |header| {
+        let res = decoder.decode_with_meta(&mut cursor, |decoded| {
+            let (header, size) = match decoded {
+                hpack::DecodedHeader::Header(header) => {
+                    let size = header.len();
+                    (Some(header), size)
+                }
+                hpack::DecodedHeader::Malformed { len } => (None, len),
+            };
+
+            self.decoded_size = self.decoded_size.saturating_add(size);
+            if check_size!().is_break() {
+                return ControlFlow::Break(());
+            }
+
+            let Some(header) = header else {
+                malformed = true;
+                return ControlFlow::Continue(());
+            };
+
             use crate::hpack::Header::*;
 
             match header {
@@ -1062,19 +1212,11 @@ impl HeaderBlock {
                     } else {
                         reg = true;
 
-                        let header_size = decoded_header_size(name.as_str().len(), value.len());
-                        headers_size += header_size;
-                        if check_size!().is_break() {
-                            return ControlFlow::Break(());
-                        }
-                        if !self.is_over_size {
-                            self.field_size += header_size;
-                            if let Err(_) = self.fields.try_append(name, value) {
-                                // HeaderMap capacity exceeded — treat as over-size
-                                // so the stream is rejected downstream (RST_STREAM / 431)
-                                // instead of panicking on the 24,577th unique header.
-                                self.is_over_size = true;
-                            }
+                        if !self.is_over_size && self.fields.try_append(name, value).is_err() {
+                            // HeaderMap capacity exceeded — treat as over-size
+                            // so the stream is rejected downstream (RST_STREAM / 431)
+                            // instead of panicking on the 24,577th unique header.
+                            self.is_over_size = true;
                         }
                     }
                 }
@@ -1092,6 +1234,7 @@ impl HeaderBlock {
         match res {
             Ok(()) => {}
             Err(e) => {
+                self.is_malformed = malformed;
                 tracing::trace!("hpack decoding error; err={:?}", e);
                 return Err(e.into());
             }
@@ -1102,16 +1245,14 @@ impl HeaderBlock {
             return Err(Error::HeaderListWayTooLarge);
         }
 
-        if malformed {
-            tracing::trace!("malformed message");
-            return Err(Error::MalformedMessage);
-        }
+        self.is_malformed = malformed;
 
         Ok(())
     }
 
     fn into_encoding(self, encoder: &mut hpack::Encoder) -> EncodingHeaderBlock {
-        let mut hpack = BytesMut::new();
+        let mut hpack = encoder.take_scratch();
+        hpack.clear();
         let headers = Iter {
             pseudo: Some(self.pseudo),
             fields: self.fields.into_iter(),
@@ -1119,46 +1260,41 @@ impl HeaderBlock {
 
         encoder.encode(headers, &mut hpack);
 
-        EncodingHeaderBlock {
-            hpack: hpack.freeze(),
-        }
-    }
-
-    /// Calculates the size of the currently decoded header list.
-    ///
-    /// According to http://httpwg.org/specs/rfc7540.html#SETTINGS_MAX_HEADER_LIST_SIZE
-    ///
-    /// > The value is based on the uncompressed size of header fields,
-    /// > including the length of the name and value in octets plus an
-    /// > overhead of 32 octets for each header field.
-    fn calculate_header_list_size(&self) -> usize {
-        macro_rules! pseudo_size {
-            ($name:ident) => {{
-                self.pseudo
-                    .$name
-                    .as_ref()
-                    .map(|m| decoded_header_size(stringify!($name).len() + 1, m.as_str().len()))
-                    .unwrap_or(0)
-            }};
-        }
-
-        pseudo_size!(method)
-            + pseudo_size!(scheme)
-            + pseudo_size!(status)
-            + pseudo_size!(authority)
-            + pseudo_size!(path)
-            + self.field_size
+        EncodingHeaderBlock { hpack }
     }
 }
 
 fn calculate_headermap_size(map: &HeaderMap) -> usize {
     map.iter()
         .map(|(name, value)| decoded_header_size(name.as_str().len(), value.len()))
-        .sum::<usize>()
+        .fold(0, usize::saturating_add)
+}
+
+fn calculate_header_list_size(pseudo: &Pseudo, fields: &HeaderMap) -> usize {
+    let mut size = calculate_headermap_size(fields);
+
+    macro_rules! add_pseudo_size {
+        ($name:ident) => {
+            if let Some(value) = pseudo.$name.as_ref() {
+                size = size.saturating_add(decoded_header_size(
+                    stringify!($name).len() + 1,
+                    value.as_str().len(),
+                ));
+            }
+        };
+    }
+
+    add_pseudo_size!(method);
+    add_pseudo_size!(scheme);
+    add_pseudo_size!(status);
+    add_pseudo_size!(authority);
+    add_pseudo_size!(path);
+    add_pseudo_size!(protocol);
+    size
 }
 
 fn decoded_header_size(name: usize, value: usize) -> usize {
-    name + value + 32
+    32usize.saturating_add(name).saturating_add(value)
 }
 
 #[cfg(test)]
@@ -1167,7 +1303,7 @@ mod test {
 
     use super::*;
     use crate::frame;
-    use crate::hpack::{huffman, Encoder};
+    use crate::hpack::{Encoder, huffman};
 
     #[test]
     fn test_nameless_header_at_resume() {
@@ -1207,9 +1343,11 @@ mod test {
 
         dst.clear();
 
-        assert!(continuation
-            .encode(&mut (&mut dst).limit(frame::HEADER_LEN + 16))
-            .is_none());
+        assert!(
+            continuation
+                .encode(&mut (&mut dst).limit(frame::HEADER_LEN + 16))
+                .is_none()
+        );
 
         world.extend_from_slice(&dst[9..12]);
         assert_eq!("world", huff_decode(&world));
@@ -1222,6 +1360,22 @@ mod test {
         assert_eq!("zomg", huff_decode(&dst[15..18]));
         assert_eq!(&[15, 47, 0x80 | 3], &dst[18..21]);
         assert_eq!("sup", huff_decode(&dst[21..]));
+    }
+
+    #[test]
+    fn stream_dependency_preserves_flags_and_ignores_self_dependency() {
+        let stream_id = StreamId::from(3);
+        let mut headers = Headers::trailers(stream_id, HeaderMap::new());
+
+        headers.set_stream_dependency(StreamDependency::new(StreamId::zero(), 15, false));
+        assert!(headers.flags.is_end_headers());
+        assert!(headers.flags.is_end_stream());
+        assert!(headers.flags.is_priority());
+
+        let mut self_dependent = Headers::new(stream_id, Pseudo::default(), HeaderMap::new());
+        self_dependent.set_stream_dependency(StreamDependency::new(stream_id, 15, false));
+        assert!(!self_dependent.flags.is_priority());
+        assert!(self_dependent.stream_dep.is_none());
     }
 
     fn huff_decode(src: &[u8]) -> BytesMut {

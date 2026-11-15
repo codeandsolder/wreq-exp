@@ -15,6 +15,8 @@ pub(super) struct GoAway {
     going_away: Option<GoingAway>,
     /// Whether the user started the GOAWAY by calling `abrupt_shutdown`.
     is_user_initiated: bool,
+    /// Whether a GOAWAY the user asked for has been buffered.
+    is_user_buffered: bool,
     /// A GOAWAY frame that must be buffered in the Codec immediately.
     pending: Option<frame::GoAway>,
 }
@@ -43,6 +45,7 @@ impl GoAway {
             close_now: false,
             going_away: None,
             is_user_initiated: false,
+            is_user_buffered: false,
             pending: None,
         }
     }
@@ -70,6 +73,10 @@ impl GoAway {
 
     pub fn go_away_now(&mut self, f: frame::GoAway) {
         self.close_now = true;
+        // Keep the reason of a GOAWAY the user asked for.
+        if self.is_user_initiated {
+            return;
+        }
         if let Some(ref going_away) = self.going_away {
             // Prevent sending the same GOAWAY twice.
             if going_away.last_processed_id == f.last_stream_id() && going_away.reason == f.reason()
@@ -81,8 +88,10 @@ impl GoAway {
     }
 
     pub fn go_away_from_user(&mut self, f: frame::GoAway) {
-        self.is_user_initiated = true;
+        // A later GOAWAY from the user still replaces an earlier one.
+        self.is_user_initiated = false;
         self.go_away_now(f);
+        self.is_user_initiated = true;
     }
 
     /// Return if a GOAWAY has ever been scheduled.
@@ -90,8 +99,17 @@ impl GoAway {
         self.going_away.is_some()
     }
 
+    /// Returns whether a GOAWAY waits to be buffered.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
     pub fn is_user_initiated(&self) -> bool {
         self.is_user_initiated
+    }
+
+    pub fn is_user_buffered(&self) -> bool {
+        self.is_user_buffered
     }
 
     /// Returns the going away info, if any.
@@ -116,7 +134,9 @@ impl GoAway {
 
     /// Try to write a pending GOAWAY frame to the buffer.
     ///
-    /// If a frame is written, the `Reason` of the GOAWAY is returned.
+    /// If a frame is written, the `Reason` of the GOAWAY is returned. Only a
+    /// GOAWAY that closes the connection now returns `Pending` while it waits
+    /// for room.
     pub fn send_pending_go_away<T, B>(
         &mut self,
         cx: &mut Context,
@@ -127,13 +147,18 @@ impl GoAway {
         B: Buf,
     {
         if let Some(frame) = self.pending.take() {
-            if !dst.poll_ready(cx)?.is_ready() {
+            if !dst.poll_send_capacity(cx)?.is_ready() {
                 self.pending = Some(frame);
-                return Poll::Pending;
+                return if self.close_now {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(None)
+                };
             }
 
             let reason = frame.reason();
             dst.buffer(frame.into()).expect("invalid GOAWAY frame");
+            self.is_user_buffered |= self.is_user_initiated;
 
             return Poll::Ready(Some(Ok(reason)));
         } else if self.should_close_now() {

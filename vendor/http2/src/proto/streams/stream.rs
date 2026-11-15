@@ -1,4 +1,4 @@
-use crate::{tracing, Reason};
+use crate::{Reason, tracing};
 
 use super::*;
 
@@ -50,6 +50,11 @@ pub(super) struct Stream {
 
     /// Task tracking additional send capacity (i.e. window updates).
     send_task: Option<Waker>,
+
+    /// `SendRequest::poll_ready` waiting for this stream to leave
+    /// `pending_open`. Kept apart from `send_task`, which the stream's own
+    /// `SendStream` may hold at the same time.
+    open_task: Option<Waker>,
 
     /// Frames pending for this stream being sent to the socket
     pub pending_send: buffer::Deque,
@@ -114,6 +119,19 @@ pub(super) struct Stream {
 
     /// Validate content-length headers
     pub content_length: ContentLength,
+
+    /// Initial request window state, only for clients using a stream target.
+    pub initial_window: Option<InitialWindow>,
+
+    /// `HeadersDependency::Chain` link of a client request.
+    pub chain_link: Option<ChainLink>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialWindow {
+    Pending,
+    /// SETTINGS baseline already included in this stream's receive window.
+    Sent(WindowSize),
 }
 
 /// State related to validating a stream's content-length
@@ -121,6 +139,8 @@ pub(super) struct Stream {
 pub enum ContentLength {
     Omitted,
     Head,
+    /// The request was CONNECT; see [`ContentLength::ignores`].
+    Connect,
     Remaining(u64),
 }
 
@@ -171,6 +191,7 @@ impl Stream {
             requested_send_capacity: 0,
             buffered_send_data: 0,
             send_task: None,
+            open_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
             next_pending_send_capacity: None,
@@ -194,6 +215,8 @@ impl Stream {
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
+            initial_window: None,
+            chain_link: None,
         }
     }
 
@@ -341,10 +364,8 @@ impl Stream {
                 Some(val) => *rem = val,
                 None => return Err(()),
             },
-            ContentLength::Head => {
-                if len != 0 {
-                    return Err(());
-                }
+            ContentLength::Head if len != 0 => {
+                return Err(());
             }
             _ => {}
         }
@@ -364,6 +385,13 @@ impl Stream {
         if let Some(task) = self.send_task.take() {
             task.wake();
         }
+        if let Some(task) = self.open_task.take() {
+            task.wake();
+        }
+    }
+
+    pub fn wait_open(&mut self, cx: &Context) {
+        self.open_task = Some(cx.waker().clone());
     }
 
     pub fn wait_send(&mut self, cx: &Context) {
@@ -405,6 +433,7 @@ impl fmt::Debug for Stream {
             .field("requested_send_capacity", &self.requested_send_capacity)
             .field("buffered_send_data", &self.buffered_send_data)
             .h2_field_some("send_task", &self.send_task.as_ref().map(|_| ()))
+            .h2_field_some("open_task", &self.open_task.as_ref().map(|_| ()))
             .h2_field_if_then(
                 "pending_send",
                 !self.pending_send.is_empty(),
@@ -596,5 +625,17 @@ impl store::Next for NextResetExpire {
 impl ContentLength {
     pub fn is_head(&self) -> bool {
         matches!(*self, Self::Head)
+    }
+
+    /// Whether a response with `status` ignores its content-length, even an invalid one.
+    ///
+    /// A server must not send the header on a 1xx, which has no content, and a client ignores
+    /// it on a 2xx to CONNECT, which starts a tunnel instead.
+    /// <https://www.rfc-editor.org/rfc/rfc9110#section-8.6>
+    /// <https://www.rfc-editor.org/rfc/rfc9110#section-9.3.6>
+    pub fn ignores(&self, status: Option<http::StatusCode>) -> bool {
+        status.is_some_and(|status| {
+            status.is_informational() || (matches!(*self, Self::Connect) && status.is_success())
+        })
     }
 }

@@ -207,7 +207,7 @@
 //!
 //! ## Certificate Store
 //!
-//! By default, wreq uses static certificates from the Chromium Root Store. The `webpki-roots`
+//! By default, wreq uses static certificates from the Mozilla Root Store. The `chromium-roots`
 //! feature can be used alone or combined with it; certificates shared by both bundles are loaded
 //! once. Bundled roots ignore certificates installed on the host and update only with their
 //! dependencies. Chromium-specific root metadata constraints are not applied. Disable both root
@@ -221,7 +221,12 @@
 //! The following are a list of [Cargo features][cargo-features] that can be
 //! enabled or disabled:
 //!
-//! - **cookies**: Provides cookie session support.
+//! - **http2** *(enabled by default)*: Provides HTTP/2 support. Without it, ALPN only offers
+//!   `http/1.1`.
+//! - **cookies**: Provides cookie session support. Cookies scoped to a single-label domain such as
+//!   `com` are rejected unless it is the request host.
+//! - **cookies-psl**: Also rejects cookies scoped to any public suffix, using the Public Suffix
+//!   List.
 //! - **gzip**: Provides response body gzip decompression.
 //! - **brotli**: Provides response body brotli decompression.
 //! - **zstd**: Provides response body zstd decompression.
@@ -236,8 +241,8 @@
 //! - **ws**: Provides websocket support.
 //! - **hickory-dns**: Enables a hickory-dns async resolver instead of default threadpool using
 //!   `getaddrinfo`.
-//! - **chromium-roots** *(enabled by default)*: Load static Chromium Root Store certificates.
-//! - **webpki-roots**: Load static Mozilla root certificates.
+//! - **chromium-roots**: Load static Chromium Root Store certificates.
+//! - **webpki-roots** *(enabled by default)*: Load static Mozilla root certificates.
 //! - **system-proxy**: Enable system proxy support.
 //! - **tracing**: Enable tracing logging support.
 //! - **prefix-symbols**: Prefix BoringSSL symbols to avoid OpenSSL conflicts.
@@ -308,6 +313,7 @@ mod client;
 mod conn;
 mod error;
 mod group;
+#[cfg(feature = "http2")]
 mod http2_info;
 mod into_uri;
 mod proxy;
@@ -346,17 +352,22 @@ pub use self::{
 pub mod http1 {
     //! HTTP/1 protocol implementation and utilities.
 
-    pub use wreq_proto::http1::{Http1Options, Http1OptionsBuilder};
+    pub use netty::http1::{Http1Options, Http1OptionsBuilder};
 }
 
+#[cfg(feature = "http2")]
+#[cfg_attr(docsrs, doc(cfg(feature = "http2")))]
 pub mod http2 {
     //! HTTP/2 protocol implementation and utilities.
 
-    pub use http2::frame::{
-        Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
-        SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
+    pub use http2::{
+        ext::{HeadersDependency, HeadersPriority},
+        frame::{
+            Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
+            SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
+        },
     };
-    pub use wreq_proto::http2::{Http2Options, Http2OptionsBuilder};
+    pub use netty::http2::{Http2Options, Http2OptionsBuilder};
 
     pub use crate::http2_info::{Http2Info, Http2Setting};
 }

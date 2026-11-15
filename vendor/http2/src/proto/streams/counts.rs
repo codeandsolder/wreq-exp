@@ -1,5 +1,43 @@
 use super::*;
+use crate::frame::StreamDependency;
 use crate::tracing;
+
+#[derive(Debug)]
+struct Budget {
+    spent: usize,
+    max: usize,
+}
+
+#[derive(Debug)]
+pub(super) struct BudgetExhausted;
+
+impl Budget {
+    fn new(max: usize) -> Self {
+        Budget { spent: 0, max }
+    }
+
+    fn consume(&mut self, amount: usize) -> Result<(), BudgetExhausted> {
+        let spent = self.spent.checked_add(amount).ok_or(BudgetExhausted)?;
+        if spent > self.max {
+            return Err(BudgetExhausted);
+        }
+        self.spent = spent;
+        Ok(())
+    }
+
+    fn replenish(&mut self, amount: usize) {
+        self.spent = self.spent.saturating_sub(amount);
+    }
+
+    fn set_max(&mut self, max: usize) {
+        self.max = max;
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.max.saturating_sub(self.spent)
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Counts {
@@ -40,6 +78,20 @@ pub(super) struct Counts {
     /// Total number of locally reset streams due to protocol error across the
     /// lifetime of the connection.
     num_local_error_reset_streams: usize,
+
+    /// connection-level budget for DATA framing overhead.
+    data_frame_budget: Budget,
+
+    /// Whether the DATA frame budget follows the target connection window.
+    data_frame_budget_is_auto: bool,
+
+    /// Number of consecutive empty, non-final DATA frames received since the
+    /// last DATA frame carrying payload.
+    num_recv_empty_data_frames: usize,
+
+    /// Open requests offered as `HEADERS` chain parents. Kept here because
+    /// every stream close passes through [`Counts::transition_after`].
+    chain_parents: ChainParents,
 }
 
 impl Counts {
@@ -57,7 +109,53 @@ impl Counts {
             num_remote_reset_streams: 0,
             max_local_error_reset_streams: config.local_max_error_reset_streams,
             num_local_error_reset_streams: 0,
+            data_frame_budget: Budget::new(config.data_frame_budget.resolve(None)),
+            data_frame_budget_is_auto: config.data_frame_budget.is_auto(),
+            num_recv_empty_data_frames: 0,
+            chain_parents: ChainParents::default(),
         }
+    }
+
+    pub fn set_target_connection_window_size(&mut self, size: WindowSize) {
+        if self.data_frame_budget_is_auto {
+            self.data_frame_budget
+                .set_max(DataFrameBudget::Auto.resolve(Some(size)));
+        }
+    }
+
+    /// Records the framing overhead of a DATA frame.
+    pub fn record_data_frame(&mut self, payload_len: usize) -> Result<(), BudgetExhausted> {
+        if payload_len == 0 {
+            self.num_recv_empty_data_frames = self
+                .num_recv_empty_data_frames
+                .checked_add(1)
+                .ok_or(BudgetExhausted)?;
+            if self.num_recv_empty_data_frames > MAX_RECV_EMPTY_DATA_FRAMES {
+                return Err(BudgetExhausted);
+            }
+            Ok(())
+        } else if payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
+            self.data_frame_budget
+                .consume(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len)
+        } else {
+            self.data_frame_budget
+                .replenish(payload_len - DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD);
+            Ok(())
+        }
+    }
+
+    /// Releases the framing overhead of a DATA frame that is no longer
+    /// buffered internally.
+    pub fn release_data_frame(&mut self, payload_len: usize) {
+        if payload_len != 0 && payload_len < DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD {
+            self.data_frame_budget
+                .replenish(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD - payload_len);
+        }
+    }
+
+    /// Ends the current run of empty DATA frames.
+    pub fn reset_empty_data_frames(&mut self) {
+        self.num_recv_empty_data_frames = 0;
     }
 
     /// Returns true when the next opened stream will reach capacity of outbound streams
@@ -209,7 +307,14 @@ impl Counts {
         ret
     }
 
-    // TODO: move this to macro?
+    /// Chooses the `HEADERS` chain parent as a request's initial `HEADERS` is
+    /// written, and offers the request as a parent in turn.
+    pub fn attach_chain(&mut self, stream: &mut Stream) -> Option<StreamDependency> {
+        self.chain_parents.attach(stream)
+    }
+
+    /// Settles the stream's counts after an action. `is_reset_counted` tells
+    /// whether it held a reset slot, i.e. was queued to expire, beforehand.
     pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
         tracing::trace!(
             "transition_after; stream={:?}; state={:?}; is_closed={:?}; \
@@ -224,12 +329,17 @@ impl Counts {
             self.num_send_streams
         );
 
+        self.chain_parents.detach(&mut stream);
+
+        // The reset slot belongs to the expiration queue entry, so it is freed
+        // once the stream leaves the queue, even with frames still to send.
+        if is_reset_counted && !stream.is_pending_reset_expiration() {
+            self.dec_num_reset_streams();
+        }
+
         if stream.is_closed() {
             if !stream.is_pending_reset_expiration() {
                 stream.unlink();
-                if is_reset_counted {
-                    self.dec_num_reset_streams();
-                }
             }
 
             if !stream.state.is_scheduled_reset() && stream.is_counted {
@@ -284,5 +394,177 @@ impl Drop for Counts {
         if !thread::panicking() {
             debug_assert!(!self.has_streams());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+
+    fn counts_config() -> Config {
+        Config {
+            initial_max_send_streams: 0,
+            local_max_buffer_size: 0,
+            local_next_stream_id: 2.into(),
+            local_push_enabled: false,
+            extended_connect_protocol_enabled: false,
+            local_reset_duration: Duration::ZERO,
+            local_reset_max: 0,
+            remote_reset_max: 0,
+            remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+            remote_max_initiated: None,
+            local_max_error_reset_streams: None,
+            data_frame_budget: DataFrameBudget::Configured(DEFAULT_DATA_FRAME_BUDGET),
+            headers_priority_policy: HeadersPriorityPolicy::default(),
+            headers_pseudo_order: None,
+        }
+    }
+
+    fn counts() -> Counts {
+        Counts::new(peer::Dyn::Server, &counts_config())
+    }
+
+    #[test]
+    fn budget_is_bounded() {
+        let mut budget = Budget::new(10);
+
+        budget.consume(4).unwrap();
+        budget.replenish(20);
+        assert_eq!(budget.available(), 10);
+    }
+
+    #[test]
+    fn budget_reports_exhaustion_without_underflowing() {
+        let mut budget = Budget::new(10);
+
+        budget.consume(10).unwrap();
+        assert!(budget.consume(1).is_err());
+        assert_eq!(budget.available(), 0);
+    }
+
+    #[test]
+    fn resizing_budget_preserves_outstanding_charges() {
+        let mut budget = Budget::new(100);
+        budget.consume(60).unwrap();
+
+        budget.set_max(200);
+        assert_eq!(budget.available(), 140);
+
+        budget.set_max(40);
+        assert_eq!(budget.available(), 0);
+        assert!(budget.consume(1).is_err());
+
+        budget.replenish(30);
+        assert_eq!(budget.available(), 10);
+    }
+
+    #[test]
+    fn auto_budget_tracks_target_window_and_configured_budget_does_not() {
+        let mut auto = Counts::new(
+            peer::Dyn::Server,
+            &Config {
+                data_frame_budget: DataFrameBudget::Auto,
+                ..counts_config()
+            },
+        );
+        auto.set_target_connection_window_size(1024 * 1024);
+        assert_eq!(auto.data_frame_budget.max, 512 * 1024);
+        for _ in 0..1_000 {
+            auto.record_data_frame(171).unwrap();
+        }
+
+        let mut configured = Counts::new(
+            peer::Dyn::Server,
+            &Config {
+                data_frame_budget: DataFrameBudget::Configured(123),
+                ..counts_config()
+            },
+        );
+        configured.set_target_connection_window_size(1024 * 1024);
+        assert_eq!(configured.data_frame_budget.max, 123);
+    }
+
+    #[test]
+    fn good_sized_data_frames_do_not_exhaust_budget() {
+        let mut counts = counts();
+
+        for _ in 0..1_000_000 {
+            counts
+                .record_data_frame(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn consumed_small_data_frames_do_not_exhaust_budget() {
+        let mut counts = counts();
+
+        for _ in 0..1_000_000 {
+            counts.record_data_frame(1).unwrap();
+            counts.release_data_frame(1);
+        }
+    }
+
+    #[test]
+    fn empty_data_frames_do_not_consume_data_frame_budget() {
+        let mut counts = counts();
+        counts.data_frame_budget = Budget::new(0);
+
+        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
+            counts.record_data_frame(0).unwrap();
+        }
+
+        // Empty frames have their own limit, while a non-empty small frame
+        // still consumes the independently configured DATA frame budget.
+        assert!(counts.record_data_frame(0).is_err());
+        assert!(counts.record_data_frame(1).is_err());
+    }
+
+    #[test]
+    fn large_data_frames_do_not_replenish_empty_data_frame_limit() {
+        let mut counts = counts();
+
+        for _ in 0..MAX_RECV_EMPTY_DATA_FRAMES {
+            counts.record_data_frame(0).unwrap();
+            counts
+                .record_data_frame(DEFAULT_DATA_FRAME_OVERHEAD_THRESHOLD * 2)
+                .unwrap();
+        }
+        assert!(counts.record_data_frame(0).is_err());
+    }
+
+    #[test]
+    fn expired_reset_frees_its_slot_before_frames_flush() {
+        let config = Config {
+            local_reset_max: 1,
+            ..counts_config()
+        };
+        let mut counts = Counts::new(peer::Dyn::Client, &config);
+        let mut recv = Recv::new(peer::Dyn::Client, &config);
+        let mut store = Store::new();
+        let mut buffer = Buffer::<Frame<Bytes>>::new();
+        let id = StreamId::from(1);
+
+        // A request canceled while its HEADERS, stood in for by any frame, wait
+        // for a stream slot.
+        let mut stream = store.insert(id, Stream::new(id, 0, 0));
+        stream.state.set_scheduled_reset(frame::Reason::CANCEL);
+        stream
+            .pending_send
+            .push_back(&mut buffer, frame::Data::new(id, Bytes::new()).into());
+        recv.enqueue_reset_expiration(&mut stream, &mut counts);
+        assert!(!counts.can_inc_num_reset_streams());
+
+        // The reset expires before the queued frame is written.
+        std::thread::sleep(Duration::from_millis(1));
+        recv.clear_expired_reset_streams(&mut store, &mut counts);
+        assert!(counts.can_inc_num_reset_streams());
+
+        // Writing it later frees the stream without a second decrement.
+        let mut stream = store.find_mut(&id).unwrap();
+        stream.pending_send.pop_front(&mut buffer);
+        counts.transition_after(stream, false);
+        assert!(store.find_mut(&id).is_none());
     }
 }

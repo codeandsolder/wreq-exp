@@ -84,6 +84,7 @@ jobs:
       matrix:
         feature-set:
           - ""
+          - "--no-default-features --features tokio-rt,webpki-roots"
           - "--features compio-rt"
           - "--all-features"
           - "--features form"

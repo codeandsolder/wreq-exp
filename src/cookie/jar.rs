@@ -7,7 +7,10 @@ use http::{Uri, Version};
 
 use super::{
     Cookie, CookieStore, Cookies, IntoCookie,
-    store::{DEFAULT_PATH, Store, canonical_host, cookie_is_expired, domain_match, normalize_path},
+    store::{
+        DEFAULT_PATH, Store, canonical_host, cookie_is_expired, domain_match, is_public_suffix,
+        normalize_path,
+    },
 };
 use crate::{IntoUri, ext::UriExt, header::HeaderValue, sync::RwLock};
 
@@ -49,15 +52,15 @@ impl Jar {
         let host = canonical_host(uri.host()?)?;
         let now = OffsetDateTime::now_utc();
         let store = self.0.read();
-        let cookie = store
-            .cookies
+        let entry = store
+            .cookies()
             .get(&host)?
             .get(uri.path())?
             .entries(name)
             .filter(|entry| !cookie_is_expired(&entry.cookie, now))
             .min_by_key(|entry| entry.creation_index)?;
 
-        Some(Cookie::from(cookie.cookie.clone()))
+        Some(Cookie::from(entry.cookie.clone()).with_host(host))
     }
 
     /// Returns whether an unexpired cookie exists for an exact URI scope.
@@ -70,11 +73,12 @@ impl Jar {
         let Some(host) = uri.host().and_then(canonical_host) else {
             return false;
         };
+
         let now = OffsetDateTime::now_utc();
 
         self.0
             .read()
-            .cookies
+            .cookies()
             .get(&host)
             .and_then(|path_map| path_map.get(uri.path()))
             .is_some_and(|cookie_map| {
@@ -84,36 +88,43 @@ impl Jar {
             })
     }
 
-    /// Returns all unexpired cookies in the jar.
+    /// Returns all unexpired cookies in creation order.
     ///
-    /// The returned cookies are owned snapshots with their effective stored `Path`. Host-only
-    /// cookies keep their `Domain` attribute absent, so importing a snapshot into another jar does
-    /// not broaden its domain scope. Snapshots are returned in creation order.
+    /// Each snapshot preserves its effective `Path` and canonical storage host. Host-only cookies
+    /// keep `Domain` absent; use [`Cookie::host`] when restoring them.
     ///
     /// # Example
     /// ```
     /// use wreq::cookie::Jar;
-    /// let jar = Jar::default();
-    /// jar.add("foo=bar; Domain=example.com", "http://example.com");
-    /// for cookie in jar.get_all() {
-    ///     println!("{}={}", cookie.name(), cookie.value());
+    /// let source = Jar::default();
+    /// source.add("session=abc; Secure", "https://example.com");
+    ///
+    /// let target = Jar::default();
+    /// for cookie in source.get_all() {
+    ///     if let Some(host) = cookie.host() {
+    ///         let scheme = if cookie.secure() { "https" } else { "http" };
+    ///         let uri = format!("{scheme}://{host}/");
+    ///         target.add(cookie, uri);
+    ///     }
     /// }
+    /// assert_eq!(target.get_all().count(), 1);
     /// ```
     pub fn get_all(&self) -> impl Iterator<Item = Cookie<'static>> {
         let now = OffsetDateTime::now_utc();
         let mut cookies = self
             .0
             .read()
-            .cookies
-            .values()
-            .flat_map(|path_map| {
-                path_map.values().flat_map(|cookie_map| {
-                    cookie_map.values().filter_map(|entry| {
+            .cookies()
+            .iter()
+            .flat_map(|(host, path_map)| {
+                path_map.values().flat_map(move |cookie_map| {
+                    cookie_map.values().filter_map(move |entry| {
                         if cookie_is_expired(&entry.cookie, now) {
                             return None;
                         }
 
-                        Some((entry.creation_index, Cookie::from(entry.cookie.clone())))
+                        let cookie = Cookie::from(entry.cookie.clone()).with_host(host.clone());
+                        Some((entry.creation_index, cookie))
                     })
                 })
             })
@@ -130,7 +141,7 @@ impl Jar {
         let now = OffsetDateTime::now_utc();
         self.0
             .read()
-            .cookies
+            .cookies()
             .values()
             .flat_map(|path_map| path_map.values())
             .flat_map(|cookie_map| cookie_map.values())
@@ -144,7 +155,7 @@ impl Jar {
         !self
             .0
             .read()
-            .cookies
+            .cookies()
             .values()
             .flat_map(|path_map| path_map.values())
             .flat_map(|cookie_map| cookie_map.values())
@@ -187,7 +198,7 @@ impl Jar {
         let store = self.0.read();
         store
             .matching_cookies(&uri, &host, now)
-            .map(|(_, _, entry)| Cookie::from(entry.cookie.clone()))
+            .map(|(host, _, entry)| Cookie::from(entry.cookie.clone()).with_host(host.clone()))
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -234,10 +245,11 @@ impl Jar {
             let Some(host) = uri.host().and_then(canonical_host) else {
                 return;
             };
-            let host_only = cookie.domain().is_none();
+            let mut host_only = cookie.domain().is_none();
 
             // If the canonicalized request-host does not domain-match the
-            // domain-attribute:
+            // domain-attribute, or if the domain-attribute is a public suffix
+            // and does not equal the canonicalized request-host:
             //    Ignore the cookie entirely and abort these steps.
             //
             // RFC 6265 §5.3 + §5.1.3:
@@ -247,12 +259,21 @@ impl Jar {
                 let Some(domain) = canonical_host(raw_domain) else {
                     return;
                 };
-                if !domain_match(&host, &domain) {
+                if is_public_suffix(&domain) {
+                    // A public suffix is only accepted for the request host itself, as a
+                    // host-only cookie.
+                    if domain != host {
+                        return;
+                    }
+                    cookie.unset_domain();
+                    host_only = true;
+                    host
+                } else if domain_match(&host, &domain) {
+                    cookie.set_domain(domain.to_string());
+                    domain
+                } else {
                     return;
                 }
-
-                cookie.set_domain(domain.to_string());
-                domain
             } else {
                 host
             };
@@ -294,6 +315,7 @@ impl Jar {
                 .to_owned();
 
             let mut store = self.0.write();
+            store.evict_expired(now);
             if !secure_origin
                 && store.would_overlay_secure_cookie(cookie.name(), &domain, &path, now)
             {
@@ -304,7 +326,7 @@ impl Jar {
                 store.remove_stored_cookie(&domain, &path, cookie.name(), host_only);
             } else {
                 cookie.set_path(path.clone());
-                store.insert_stored_cookie(domain, path, cookie);
+                store.insert_stored_cookie(domain, path, cookie, now);
             }
         }
     }
@@ -335,6 +357,7 @@ impl Jar {
             };
             let cookie = cookie.into();
             let mut store = self.0.write();
+            store.evict_expired(OffsetDateTime::now_utc());
             store.remove_stored_cookies(&host, uri.path(), cookie.name());
         }
     }
@@ -434,9 +457,14 @@ impl CookieStore for Jar {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration as StdDuration};
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr},
+        thread,
+        time::Duration as StdDuration,
+    };
 
     use http::{Uri, Version};
+    use url::Host;
 
     use super::{CookieStore, Cookies, Jar};
 
@@ -602,30 +630,60 @@ mod tests {
     }
 
     #[test]
-    fn jar_get_all_export_import_keeps_host_only_scope_and_effective_path() {
+    fn jar_get_all_preserves_storage_scope() {
         let source = Jar::default();
         source.add("session=abc", "http://example.com/foo/bar");
+        source.add("pref=dark; Domain=example.com", "http://www.example.com/");
+        source.add("secure=1; Secure", "https://secure.example/");
+        source.add("v6=1", "http://[::1]:8080/");
+        source.add("v4=1", "http://127.0.0.1:8080/");
 
         let exported = source.get_all().collect::<Vec<_>>();
-        assert_eq!(exported.len(), 1);
-        assert_eq!(exported[0].domain(), None);
-        assert_eq!(exported[0].path(), Some("/foo"));
+        assert_eq!(exported.len(), 5);
+
+        let session = &exported[0];
+        assert_eq!(session.host(), Some(Host::Domain("example.com")));
+        assert_eq!(session.domain(), None);
+        assert_eq!(session.path(), Some("/foo"));
+
+        let pref = &exported[1];
+        assert_eq!(pref.host(), Some(Host::Domain("example.com")));
+        assert_eq!(pref.domain(), Some("example.com"));
+        assert_eq!(exported[2].host(), Some(Host::Domain("secure.example")));
+        assert_eq!(exported[3].host(), Some(Host::Ipv6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(exported[4].host(), Some(Host::Ipv4(Ipv4Addr::LOCALHOST)));
+
+        let exact = source.get("session", "http://example.com/foo").unwrap();
+        assert_eq!(exact.host(), Some(Host::Domain("example.com")));
+
+        let matched = source
+            .matches("http://example.com/foo/bar")
+            .find(|cookie| cookie.name() == "session")
+            .unwrap();
+        assert_eq!(matched.host(), Some(Host::Domain("example.com")));
 
         let target = Jar::default();
         for cookie in exported {
-            target.add(cookie, "http://example.com/another/deeper");
+            let scheme = if cookie.secure() { "https" } else { "http" };
+            let uri = format!("{scheme}://{}/", cookie.host().unwrap());
+            target.add(cookie, uri);
         }
 
-        let imported = target.get_all().collect::<Vec<_>>();
-        assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].domain(), None);
-        assert_eq!(imported[0].path(), Some("/foo"));
-
-        let subdomain = Uri::from_static("http://api.example.com/foo/resource");
-        assert!(matches!(
-            target.cookies(&subdomain, Version::HTTP_11),
-            Cookies::Empty
-        ));
+        for uri in [
+            "http://example.com/foo/bar",
+            "http://api.example.com/",
+            "https://secure.example/",
+            "http://secure.example/",
+            "http://[::1]:9999/",
+            "http://127.0.0.1:9999/",
+        ] {
+            let uri = uri.parse::<Uri>().unwrap();
+            assert_eq!(
+                format!("{:?}", target.cookies(&uri, Version::HTTP_11)),
+                format!("{:?}", source.cookies(&uri, Version::HTTP_11)),
+                "restored jar should select the same cookies for {uri}"
+            );
+        }
     }
 
     #[test]
@@ -1221,5 +1279,38 @@ mod tests {
                 "cookie must NOT leak to {uri_str}"
             );
         }
+    }
+
+    #[test]
+    fn jar_rejects_public_suffix_domains() {
+        let jar = Jar::default();
+        let supercookies = [
+            ("a=1; Domain=com", "https://attacker.com/"),
+            ("a=1; Domain=com.", "https://attacker.com./"),
+            #[cfg(feature = "cookies-psl")]
+            ("a=1; Domain=co.uk", "https://attacker.co.uk/"),
+            #[cfg(feature = "cookies-psl")]
+            ("a=1; Domain=github.io", "https://attacker.github.io/"),
+        ];
+        for (cookie, uri) in supercookies {
+            jar.add(cookie, uri);
+        }
+        assert!(jar.is_empty());
+
+        // RFC 6265 section 5.3 step 5: a public suffix equal to the request host is host-only.
+        jar.add("local=1; Domain=localhost", "http://localhost/");
+        let cookies = |uri| jar.cookies(&Uri::from_static(uri), Version::HTTP_11);
+        assert!(matches!(
+            cookies("http://localhost/"),
+            Cookies::Compressed(_)
+        ));
+        assert!(matches!(cookies("http://sub.localhost/"), Cookies::Empty));
+
+        // A registrable domain under a short ccTLD is not a public suffix.
+        jar.add("id=1; Domain=id.me", "https://api.id.me/");
+        assert!(matches!(
+            cookies("https://www.id.me/"),
+            Cookies::Compressed(_)
+        ));
     }
 }
