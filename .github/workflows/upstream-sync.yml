@@ -22,6 +22,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+      - name: Verify upstream reconciliation scenarios
+        run: bash .github/scripts/test-upstream-sync.sh
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
