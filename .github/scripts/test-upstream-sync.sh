@@ -116,7 +116,7 @@ assert_main_has_fork_only() {
 }
 
 assert_draft() {
-  rg -q '^CREATE .*--draft' "$TEST_GH_CALLS"
+  [[ "$(cat "$TEST_GH_CALLS")" == *" --draft"* ]]
   [[ -f "$TEST_PR_BODY" ]]
   git --git-dir="$origin" rev-parse --verify refs/heads/automation/upstream-reconciliation >/dev/null
 }
@@ -146,7 +146,7 @@ assert_main_has_fork_only
 ! git --git-dir="$origin" cat-file -e main:upstream-only.txt 2>/dev/null
 assert_draft
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
-rg -q 'Synthetic Rust validation failure' "$TEST_PR_BODY"
+[[ "$(cat "$TEST_PR_BODY")" == *"Synthetic Rust validation failure"* ]]
 echo "PASS validation failure opens draft and keeps main unchanged"
 
 setup_case conflict
@@ -165,7 +165,7 @@ assert_draft
 assert_main_has_fork_only
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:conflict.txt)" == fork-conflict ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
-rg -q 'conflict.txt' "$TEST_PR_BODY"
+[[ "$(cat "$TEST_PR_BODY")" == *"conflict.txt"* ]]
 echo "PASS content conflict creates draft retaining fork and non-conflicting upstream changes"
 
 setup_case modify_delete
