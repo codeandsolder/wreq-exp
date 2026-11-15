@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info.session_reused(),
                     );
                 }
+                #[cfg(feature = "http2")]
                 if let Some(info) = response.extensions().get::<wreq::http2::Http2Info>() {
                     for (side, settings) in [
                         ("local", info.local_initial_settings()),
