@@ -401,4 +401,4 @@ http2 = { path = "vendor/http2" }
 netty = { path = "vendor/netty" }
 
 [workspace]
-exclude = ["vendor/http2", "vendor/netty"]
+exclude = ["vendor/http2", "vendor/netty", "vendor/wreq-util"]
