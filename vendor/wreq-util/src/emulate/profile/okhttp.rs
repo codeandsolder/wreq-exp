@@ -48,15 +48,21 @@ struct OkHttpTlsConfig {
 
 impl From<OkHttpTlsConfig> for TlsOptions {
     fn from(val: OkHttpTlsConfig) -> Self {
-        TlsOptions::builder()
+        let mut builder = TlsOptions::builder()
             .enable_ocsp_stapling(true)
             .curves_list(val.curves)
             .sigalgs_list(val.sigalgs_list)
             .cipher_list(val.cipher_list)
-            .tls13_cipher_list(tls13_ciphers_in_wire_order(val.cipher_list))
             .min_tls_version(TlsVersion::TLS_1_2)
-            .max_tls_version(TlsVersion::TLS_1_3)
-            .build()
+            .max_tls_version(TlsVersion::TLS_1_3);
+        // Older OkHttp profiles advertise only pre-TLS-1.3 cipher suites.
+        // Do not turn their absent TLS 1.3 preference into an explicit empty
+        // list: retain the backend's defaults, just as the old API did.
+        let tls13 = tls13_ciphers_in_wire_order(val.cipher_list);
+        if !tls13.is_empty() {
+            builder = builder.tls13_cipher_list(tls13);
+        }
+        builder.build()
     }
 }
 

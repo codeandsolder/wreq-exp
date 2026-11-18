@@ -74,8 +74,24 @@ fn safari_ios18_preserves_distinct_platform_and_cipher_settings() {
 }
 
 #[test]
-fn okhttp39_explicit_tls13_list_does_not_follow_hardware() {
+fn okhttp39_without_tls13_suites_keeps_backend_default() {
     let options = Profile::OkHttp3_9
+        .into_emulation()
+        .tls_options
+        .expect("OkHttp TLS profile");
+    assert_eq!(options.tls13_cipher_list, None);
+    assert!(
+        options
+            .cipher_list
+            .as_deref()
+            .unwrap()
+            .contains("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256")
+    );
+}
+
+#[test]
+fn okhttp313_preserves_supported_explicit_tls13_order() {
+    let options = Profile::OkHttp3_13
         .into_emulation()
         .tls_options
         .expect("OkHttp TLS profile");
