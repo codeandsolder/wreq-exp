@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::{hash::BuildHasher, pin::Pin, time::Duration};
+use std::{hash::BuildHasher, path::PathBuf, pin::Pin, time::Duration};
 
 use btls::ssl::{Ssl, SslAcceptor, SslMethod};
 use http::Method;
@@ -19,20 +19,28 @@ use tokio::{
 use tokio_btls::SslStream;
 use wreq::{Client, Proxy, tls::trust::CertStore};
 
-fn random_sock_path() -> std::path::PathBuf {
+struct UnixSocketPath(PathBuf);
+
+impl Drop for UnixSocketPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn random_sock_path() -> UnixSocketPath {
     let mut buf = std::env::temp_dir();
     // libstd uses system random to create each one
     let rng = std::collections::hash_map::RandomState::new();
     let n = rng.hash_one("uds-sock");
     buf.push(format!("test-uds-sock-{}", n));
-    buf
+    UnixSocketPath(buf)
 }
 
 #[tokio::test]
 async fn test_unix_socket() {
     let sock_path = random_sock_path();
 
-    let listener = UnixListener::bind(&sock_path).unwrap();
+    let listener = UnixListener::bind(&sock_path.0).unwrap();
     let server = async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
@@ -53,7 +61,7 @@ async fn test_unix_socket() {
     tokio::spawn(server);
 
     let client = Client::builder()
-        .proxy(Proxy::unix(sock_path).unwrap())
+        .proxy(Proxy::unix(sock_path.0.as_path()).unwrap())
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
@@ -67,7 +75,8 @@ async fn test_unix_socket() {
 async fn test_proxy_unix_socket() {
     // A local HTTPS target verifies CONNECT tunnelling without depending on
     // Google (which can return 403 or 429 based on the CI runner's IP).
-    let (cert, key) = support::tls_cert::self_signed("localhost", None);
+    let (cert, key) =
+        support::tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
     let trust = CertStore::builder()
         .add_der_cert(&cert.to_der().unwrap())
         .build()
@@ -95,13 +104,16 @@ async fn test_proxy_unix_socket() {
     });
 
     let sock_path = random_sock_path();
+    let (connect_tx, mut connect_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let listener = UnixListener::bind(&sock_path).unwrap();
+    let listener = UnixListener::bind(&sock_path.0).unwrap();
     let server = async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
-            let service = service_fn(|req: Request<Incoming>| {
+            let connect_tx = connect_tx.clone();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let connect_tx = connect_tx.clone();
                 async move {
                     if Method::CONNECT == req.method() {
                         // Received an HTTP request like:
@@ -118,6 +130,7 @@ async fn test_proxy_unix_socket() {
                         // connection be upgraded, so we can't return a response inside
                         // `on_upgrade` future.
                         let authority = req.uri().authority().cloned().unwrap();
+                        connect_tx.send(authority.to_string()).unwrap();
                         tokio::task::spawn({
                             let req = req;
                             async move {
@@ -161,21 +174,26 @@ async fn test_proxy_unix_socket() {
     let proxy_task = tokio::spawn(server);
 
     let client = Client::builder()
-        .proxy(Proxy::unix(&sock_path).unwrap())
+        .proxy(Proxy::unix(sock_path.0.as_path()).unwrap())
         .tls_cert_store(trust)
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 
     let resp = client
-        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .get(format!("https://127.0.0.1:{}/", upstream_addr.port()))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), wreq::StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "hello tunneled HTTPS");
+    assert_eq!(
+        connect_rx
+            .try_recv()
+            .expect("Unix proxy must receive CONNECT"),
+        format!("127.0.0.1:{}", upstream_addr.port())
+    );
 
     proxy_task.abort();
     upstream_task.abort();
-    std::fs::remove_file(sock_path).unwrap();
 }
