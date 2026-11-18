@@ -2,6 +2,7 @@ pub mod delay_server;
 pub mod error;
 pub mod layer;
 pub mod server;
+pub mod tls_cert;
 
 // TODO: remove once done converting to new support server?
 #[allow(unused)]

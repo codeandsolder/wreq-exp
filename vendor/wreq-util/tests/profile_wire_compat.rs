@@ -1,8 +1,10 @@
 //! Offline checks that browser profiles survive Wreq's new priority and TLS APIs.
 
-use wreq::IntoEmulation;
-use wreq::http2::{HeadersDependency, HeadersPriority};
-use wreq::tls::{EchGrease, EchGreaseAead, Tls13Cipher};
+use wreq::{
+    IntoEmulation,
+    http2::{HeadersDependency, HeadersPriority},
+    tls::{EchGrease, EchGreaseAead, Tls13Cipher},
+};
 use wreq_util::{Emulation, Platform, Profile};
 
 #[test]

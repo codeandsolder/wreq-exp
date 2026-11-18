@@ -1,7 +1,10 @@
 #![cfg(unix)]
 
-use std::{hash::BuildHasher, time::Duration};
+mod support;
 
+use std::{hash::BuildHasher, pin::Pin, time::Duration};
+
+use btls::ssl::{Ssl, SslAcceptor, SslMethod};
 use http::Method;
 use http_body_util::Full;
 use hyper::{Request, Response, body::Incoming, service::service_fn};
@@ -9,8 +12,12 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use tokio::{net::UnixListener, task};
-use wreq::{Client, Proxy};
+use tokio::{
+    net::{TcpListener, UnixListener},
+    task,
+};
+use tokio_btls::SslStream;
+use wreq::{Client, Proxy, tls::trust::CertStore};
 
 fn random_sock_path() -> std::path::PathBuf {
     let mut buf = std::env::temp_dir();
@@ -58,6 +65,35 @@ async fn test_unix_socket() {
 
 #[tokio::test]
 async fn test_proxy_unix_socket() {
+    // A local HTTPS target verifies CONNECT tunnelling without depending on
+    // Google (which can return 403 or 429 based on the CI runner's IP).
+    let (cert, key) = support::tls_cert::self_signed("localhost", None);
+    let trust = CertStore::builder()
+        .add_der_cert(&cert.to_der().unwrap())
+        .build()
+        .unwrap();
+    let mut tls_builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+    tls_builder.set_certificate(&cert).unwrap();
+    tls_builder.set_private_key(&key).unwrap();
+    let tls = tls_builder.build();
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (tcp, _) = upstream.accept().await.unwrap();
+        let ssl = Ssl::new(tls.context()).unwrap();
+        let mut stream = SslStream::new(ssl, tcp).unwrap();
+        Pin::new(&mut stream).accept().await.unwrap();
+        let service = service_fn(|req: Request<Incoming>| async move {
+            assert_eq!(req.method(), Method::GET);
+            Ok::<_, hyper::Error>(Response::new(Full::new(&b"hello tunneled HTTPS"[..])))
+        });
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .await
+            .unwrap();
+    });
+
     let sock_path = random_sock_path();
 
     let listener = UnixListener::bind(&sock_path).unwrap();
@@ -122,14 +158,24 @@ async fn test_proxy_unix_socket() {
             });
         }
     };
-    tokio::spawn(server);
+    let proxy_task = tokio::spawn(server);
 
     let client = Client::builder()
-        .proxy(Proxy::unix(sock_path).unwrap())
+        .proxy(Proxy::unix(&sock_path).unwrap())
+        .tls_cert_store(trust)
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 
-    let resp = client.get("https://www.google.com").send().await.unwrap();
-    assert!(resp.status().is_success(), "Expected successful response");
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), wreq::StatusCode::OK);
+    assert_eq!(resp.text().await.unwrap(), "hello tunneled HTTPS");
+
+    proxy_task.abort();
+    upstream_task.abort();
+    std::fs::remove_file(sock_path).unwrap();
 }
