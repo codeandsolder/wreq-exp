@@ -38,6 +38,18 @@ jobs:
       - name: Clippy check
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+  emulation-profiles:
+    name: Vendored browser profile compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify browser profiles against current Wreq TLS/H2 APIs
+        run: cargo +1.99.0 test --manifest-path vendor/wreq-util/Cargo.toml --features tokio-rt --test profile_wire_compat
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
