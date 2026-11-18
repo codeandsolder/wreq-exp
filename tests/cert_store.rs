@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, pin::Pin};
 
-mod support;
+#[path = "support/tls_cert.rs"]
+mod tls_cert;
 
 use btls::{
     pkey::{PKey, Private},
@@ -41,8 +42,7 @@ async fn serve(cert: &X509, key: &PKey<Private>) -> SocketAddr {
 
 #[tokio::test]
 async fn verify_host_overrides_uri_host() {
-    let (cert, key) =
-        support::tls_cert::self_signed("wreq.test", Some("192.0.2.1".parse().unwrap()));
+    let (cert, key) = tls_cert::self_signed("wreq.test", Some("192.0.2.1".parse().unwrap()));
     let der = cert.to_der().unwrap();
     let url = format!("https://{}/", serve(&cert, &key).await);
 

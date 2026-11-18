@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-mod support;
+#[path = "support/tls_cert.rs"]
+mod tls_cert;
 
 use std::{hash::BuildHasher, path::PathBuf, pin::Pin, time::Duration};
 
@@ -75,8 +76,7 @@ async fn test_unix_socket() {
 async fn test_proxy_unix_socket() {
     // A local HTTPS target verifies CONNECT tunnelling without depending on
     // Google (which can return 403 or 429 based on the CI runner's IP).
-    let (cert, key) =
-        support::tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
+    let (cert, key) = tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
     let trust = CertStore::builder()
         .add_der_cert(&cert.to_der().unwrap())
         .build()
