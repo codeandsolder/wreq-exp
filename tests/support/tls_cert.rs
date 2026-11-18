@@ -1,0 +1,48 @@
+//! Reusable self-signed local TLS certificates for tests with no public network dependency.
+
+use std::net::IpAddr;
+
+use btls::{
+    asn1::Asn1Time,
+    bn::BigNum,
+    ec::{EcGroup, EcKey},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    x509::{X509, X509NameBuilder, extension::SubjectAlternativeName},
+};
+
+pub fn self_signed(host: &str, ip: Option<IpAddr>) -> (X509, PKey<Private>) {
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+    let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_nid(Nid::COMMONNAME, host).unwrap();
+    let name = name.build();
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder
+        .set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap())
+        .unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+
+    let mut san = SubjectAlternativeName::new();
+    san.dns(host);
+    if let Some(ip) = ip {
+        san.ip(&ip.to_string());
+    }
+    builder
+        .append_extension(&san.build(&builder.x509v3_context(None, None)).unwrap())
+        .unwrap();
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+    (builder.build(), key)
+}
