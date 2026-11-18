@@ -9,7 +9,9 @@ stream dependency builder and the preserve-TLS-1.3-cipher-list toggle.
 The new HEADERS priority API preserves the original parent, wire weight and
 exclusivity semantics, including Firefox's declared idle parent stream 13.
 The TLS 1.3 cipher order is explicitly configured for Chrome, Firefox, Opera
-and OkHttp as well as Safari variants requesting cipher-list preservation.
+and modern OkHttp profiles as well as Safari variants requesting cipher-list preservation.
+Legacy OkHttp profiles that name no TLS 1.3 suites leave the backend defaults
+untouched; an empty explicit list is not injected.
 
 Removed AES hardware overrides have been replaced by explicit TLS 1.3 suite
 order and AES-128-GCM ECH GREASE policies, preventing the emulated fingerprint
