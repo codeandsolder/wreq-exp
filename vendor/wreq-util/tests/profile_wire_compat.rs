@@ -107,3 +107,26 @@ fn okhttp313_preserves_supported_explicit_tls13_order() {
         )
     );
 }
+
+#[test]
+fn no_browser_profile_explicitly_sets_an_empty_tls13_cipher_list() {
+    // The old combined TLS cipher strings may contain only pre-TLS-1.3
+    // suites. In that case leave the backend's normal TLS 1.3 defaults
+    // intact rather than explicitly asking BoringSSL to reset the list.
+    for &profile in Profile::VARIANTS {
+        let options = Emulation::builder()
+            .profile(profile)
+            .headers(false)
+            .build()
+            .into_emulation()
+            .tls_options
+            .expect("every browser profile supplies TLS options");
+        assert!(
+            options
+                .tls13_cipher_list
+                .as_deref()
+                .is_none_or(|list| !list.is_empty()),
+            "profile {profile:?} supplied an explicit empty TLS 1.3 cipher list"
+        );
+    }
+}
