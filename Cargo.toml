@@ -114,9 +114,9 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.19.0"
-btls = "0.5.6"
-btls-sys = "0.5.6"
-tokio-btls = "0.5.6"
+btls = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
+btls-sys = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
+tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
@@ -397,9 +397,6 @@ name = "unix_socket"
 path = "examples/unix_socket.rs"
 
 [patch.crates-io]
-btls = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
-btls-sys = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
-tokio-btls = { git = "https://github.com/0x676e67/btls", rev = "8879c026b548c25441f83ff58b39d7e22ba1b5b1" }
 http2 = { path = "vendor/http2" }
 netty = { path = "vendor/netty" }
 
