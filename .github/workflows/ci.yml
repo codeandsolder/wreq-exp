@@ -58,6 +58,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy all targets and features
         run: cargo +1.99.0 clippy --locked -p wreq --all-targets --all-features -- -D warnings
+      # Reuse the same runner, compiler setup, and incremental target for the
+      # ordinary PR build and docs instead of provisioning two more runners.
+      - name: Build all features (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo +1.99.0 build --locked -p wreq --all-features
+      - name: Build documentation (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo +1.99.0 doc --locked -p wreq --document-private-items --all-features
 
   emulation-profiles:
     name: Vendored browser profile compatibility
@@ -73,7 +81,7 @@ jobs:
 
   docs:
     name: Docs
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -148,7 +156,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.env }})
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     environment: ${{ matrix.env }}
     strategy:
