@@ -179,7 +179,10 @@ git -C "$upstream" push --quiet origin main
 run_sync
 assert_draft
 assert_main_has_fork_only
-[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:conflict.txt)" == fork-conflict ]]
+conflicted="$(git --git-dir="$origin" show automation/upstream-reconciliation:conflict.txt)"
+[[ "$conflicted" == *'<<<<<<<'* ]]
+[[ "$conflicted" == *'fork-conflict'* ]]
+[[ "$conflicted" == *'upstream-conflict'* ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
 [[ "$(cat "$TEST_PR_BODY")" == *"conflict.txt"* ]]
 echo "PASS content conflict creates draft retaining fork and non-conflicting upstream changes"
@@ -212,9 +215,10 @@ git -C "$upstream" commit --quiet -m "upstream modifies obsolete"
 git -C "$upstream" push --quiet origin main
 run_sync
 assert_draft
-assert_blob_absent automation/upstream-reconciliation:obsolete.txt
+assert_blob_absent main:obsolete.txt
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:obsolete.txt)" == upstream-edited ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
-echo "PASS delete/modify conflict retains fork deletion"
+echo "PASS delete/modify conflict preserves upstream change for manual resolution"
 
 setup_case file_directory
 commit_fork_file
@@ -230,9 +234,12 @@ git -C "$upstream" commit --quiet -m 'upstream adds directory at path'
 git -C "$upstream" push --quiet origin main
 run_sync
 assert_draft
-[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:region)" == 'fork uses file' ]]
+fork_file="$(git --git-dir="$origin" ls-tree -r --name-only automation/upstream-reconciliation | rg '^region~' | head -n 1)"
+[[ -n "$fork_file" ]]
+[[ "$(git --git-dir="$origin" show "automation/upstream-reconciliation:$fork_file")" == 'fork uses file' ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:region/child.txt)" == 'upstream uses directory' ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
-echo "PASS file/directory conflict keeps fork path and unrelated upstream additions"
+echo "PASS file/directory conflict retains both versions as distinct paths for resolution"
 
 setup_case directory_file
 commit_fork_file
@@ -249,8 +256,11 @@ git -C "$upstream" push --quiet origin main
 run_sync
 assert_draft
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:region/child.txt)" == 'fork uses directory' ]]
+upstream_file="$(git --git-dir="$origin" ls-tree -r --name-only automation/upstream-reconciliation | rg '^region~' | head -n 1)"
+[[ -n "$upstream_file" ]]
+[[ "$(git --git-dir="$origin" show "automation/upstream-reconciliation:$upstream_file")" == 'upstream uses file' ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
-echo "PASS directory/file conflict retains fork subtree"
+echo "PASS directory/file conflict preserves both versions for resolution"
 
 setup_case unrelated
 commit_fork_file
@@ -349,7 +359,7 @@ assert_draft
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/workflows/ci.yml)" == 'name: Fork CI' ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/workflow-changes.patch)" == *'name: Upstream CI'* ]]
-[[ "$(cat "$TEST_PR_BODY")" == *'Git merge conflicts'* ]]
+[[ "$(cat "$TEST_PR_BODY")" == *'Upstream source conflicts'* ]]
 echo "PASS workflow conflict retains fork workflow and upstream patch without blocked commit history"
 
 source_checkpoint() {
@@ -413,6 +423,50 @@ assert_blob_absent main:.github/workflows/ci.yml
 [[ ! -f "$TEST_PR_BODY" ]]
 [[ "$(wc -l < "$TEST_CARGO_CALLS")" -eq 5 ]]
 echo "PASS subsequent upstream source auto-syncs without workflow-write permission"
+
+setup_case checkpoint_true_content_conflict
+commit_fork_file
+commit_upstream_file
+source_checkpoint
+printf 'fork-specific edit\n' > "$work/conflict.txt"
+git -C "$work" add conflict.txt
+git -C "$work" commit --quiet -m 'fork edit after source checkpoint'
+git -C "$work" push --quiet origin main
+printf 'upstream-specific edit\n' > "$upstream/conflict.txt"
+git -C "$upstream" add conflict.txt
+git -C "$upstream" commit --quiet -m 'upstream edit after source checkpoint'
+git -C "$upstream" push --quiet origin main
+run_sync
+assert_draft
+conflicted="$(git --git-dir="$origin" show automation/upstream-reconciliation:conflict.txt)"
+[[ "$conflicted" == *'<<<<<<<'* ]]
+[[ "$conflicted" == *'fork-specific edit'* ]]
+[[ "$conflicted" == *'upstream-specific edit'* ]]
+[[ "$(git --git-dir="$origin" show main:conflict.txt)" == 'fork-specific edit' ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/reviewed-source-sha)" == "$(git -C "$upstream" rev-parse HEAD)" ]]
+echo "PASS true post-checkpoint content conflicts preserve both sides in a draft"
+
+setup_case checkpoint_add_add_conflict
+commit_fork_file
+commit_upstream_file
+source_checkpoint
+mkdir -p "$work/tests/support" "$upstream/tests/support"
+printf 'fork test helper\n' > "$work/tests/support/tls_cert.rs"
+git -C "$work" add tests/support/tls_cert.rs
+git -C "$work" commit --quiet -m 'fork adds helper'
+git -C "$work" push --quiet origin main
+printf 'upstream test helper\n' > "$upstream/tests/support/tls_cert.rs"
+git -C "$upstream" add tests/support/tls_cert.rs
+git -C "$upstream" commit --quiet -m 'upstream adds same helper path'
+git -C "$upstream" push --quiet origin main
+run_sync
+assert_draft
+conflicted="$(git --git-dir="$origin" show automation/upstream-reconciliation:tests/support/tls_cert.rs)"
+[[ "$conflicted" == *'<<<<<<<'* ]]
+[[ "$conflicted" == *'fork test helper'* ]]
+[[ "$conflicted" == *'upstream test helper'* ]]
+[[ "$(git --git-dir="$origin" show main:tests/support/tls_cert.rs)" == 'fork test helper' ]]
+echo "PASS independent test helper additions preserve both implementations"
 
 setup_case checkpoint_validation_failure
 commit_fork_file
