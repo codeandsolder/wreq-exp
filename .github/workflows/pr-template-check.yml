@@ -12,7 +12,7 @@ jobs:
     if: >-
       ${{
         !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association) &&
-        !contains(fromJSON('["dependabot[bot]", "github-actions[bot]"]'), github.event.pull_request.user.login)
+        github.event.pull_request.user.type != 'Bot'
       }}
     runs-on: ubuntu-latest
     steps:
