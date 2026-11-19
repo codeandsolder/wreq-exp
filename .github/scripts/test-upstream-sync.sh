@@ -328,6 +328,7 @@ assert_blob_absent automation/upstream-reconciliation:.github/workflows/ci.yml
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/workflow-changes.patch)" == *'name: Upstream CI'* ]]
 [[ "$(cat "$TEST_PR_BODY")" == *'authorized to change workflows'* ]]
 assert_blob_absent main:upstream-only.txt
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/reviewed-source-sha)" == "$(git -C "$upstream" rev-parse HEAD)" ]]
 echo "PASS workflow-adding upstream becomes pushable draft with full patch and unchanged main"
 
 setup_case conflicting_workflow
@@ -350,6 +351,101 @@ assert_draft
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/workflow-changes.patch)" == *'name: Upstream CI'* ]]
 [[ "$(cat "$TEST_PR_BODY")" == *'Git merge conflicts'* ]]
 echo "PASS workflow conflict retains fork workflow and upstream patch without blocked commit history"
+
+source_checkpoint() {
+  mkdir -p "$work/.github/upstream-reconciliation"
+  git -C "$upstream" rev-parse HEAD > "$work/.github/upstream-reconciliation/reviewed-source-sha"
+  git -C "$work" add .github/upstream-reconciliation/reviewed-source-sha
+  git -C "$work" commit --quiet -m 'review upstream source snapshot'
+  git -C "$work" push --quiet origin main
+}
+
+setup_case checkpoint_noop
+commit_fork_file
+commit_upstream_file
+source_checkpoint
+original_main="$(git --git-dir="$origin" rev-parse main)"
+run_sync
+[[ "$(git --git-dir="$origin" rev-parse main)" == "$original_main" ]]
+[[ ! -f "$TEST_GH_CALLS" ]]
+echo "PASS accepted upstream source checkpoint prevents duplicate reconciliation"
+
+setup_case checkpoint_invalid
+commit_fork_file
+commit_upstream_file
+mkdir -p "$work/.github/upstream-reconciliation"
+printf '%040d\n' 0 > "$work/.github/upstream-reconciliation/reviewed-source-sha"
+git -C "$work" add .github/upstream-reconciliation/reviewed-source-sha
+git -C "$work" commit --quiet -m 'invalid upstream source checkpoint'
+git -C "$work" push --quiet origin main
+if run_sync; then
+  echo 'Expected invalid source checkpoint to block synchronization' >&2
+  exit 1
+fi
+[[ "$(cat "$RUNNER_TEMP/output.log")" == *'Invalid or rewritten upstream source checkpoint'* ]]
+[[ ! -f "$TEST_GH_CALLS" ]]
+echo "PASS invalid source checkpoint rejects unrelated or rewritten upstream history"
+
+setup_case checkpoint_incremental
+commit_fork_file
+commit_upstream_file
+mkdir -p "$upstream/.github/workflows"
+printf 'name: Original CI\n' > "$upstream/.github/workflows/ci.yml"
+git -C "$upstream" add .github/workflows
+git -C "$upstream" commit --quiet -m 'original upstream workflow'
+git -C "$upstream" push --quiet origin main
+# Simulate a reviewed source-only merge retaining the fork's workflow tree.
+git -C "$work" show HEAD:fork-only.txt > /dev/null
+git -C "$upstream" show HEAD:upstream-only.txt > "$work/upstream-only.txt"
+git -C "$work" add upstream-only.txt
+git -C "$work" commit --quiet -m 'accept upstream source only'
+source_checkpoint
+printf 'new upstream source\n' > "$upstream/new-feature.txt"
+git -C "$upstream" add new-feature.txt
+git -C "$upstream" commit --quiet -m 'upstream feature after accepted workflow divergence'
+git -C "$upstream" push --quiet origin main
+install_workflow_push_guard
+run_sync
+assert_main_has_fork_only
+[[ "$(git --git-dir="$origin" show main:new-feature.txt)" == 'new upstream source' ]]
+[[ "$(git --git-dir="$origin" show main:.github/upstream-reconciliation/reviewed-source-sha)" == "$(git -C "$upstream" rev-parse HEAD)" ]]
+assert_blob_absent main:.github/workflows/ci.yml
+[[ ! -f "$TEST_PR_BODY" ]]
+[[ "$(wc -l < "$TEST_CARGO_CALLS")" -eq 5 ]]
+echo "PASS subsequent upstream source auto-syncs without workflow-write permission"
+
+setup_case checkpoint_validation_failure
+commit_fork_file
+commit_upstream_file
+source_checkpoint
+old_sha="$(git --git-dir="$origin" show main:.github/upstream-reconciliation/reviewed-source-sha)"
+printf 'later upstream update\n' > "$upstream/later.txt"
+git -C "$upstream" add later.txt
+git -C "$upstream" commit --quiet -m 'new update requires compilation'
+git -C "$upstream" push --quiet origin main
+TEST_FAIL_VALIDATE=1 run_sync
+assert_draft
+[[ "$(git --git-dir="$origin" show main:.github/upstream-reconciliation/reviewed-source-sha)" == "$old_sha" ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:later.txt)" == 'later upstream update' ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/reviewed-source-sha)" == "$(git -C "$upstream" rev-parse HEAD)" ]]
+echo "PASS failed incremental validation keeps main unchanged and publishes checkpointed draft"
+
+setup_case checkpoint_workflow_update
+commit_fork_file
+commit_upstream_file
+source_checkpoint
+mkdir -p "$upstream/.github/workflows"
+printf 'name: New upstream CI\n' > "$upstream/.github/workflows/ci.yml"
+git -C "$upstream" add .github/workflows
+git -C "$upstream" commit --quiet -m 'later upstream workflow change'
+git -C "$upstream" push --quiet origin main
+install_workflow_push_guard
+run_sync
+assert_draft
+assert_blob_absent automation/upstream-reconciliation:.github/workflows/ci.yml
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/reviewed-source-sha)" == "$(git -C "$upstream" rev-parse HEAD)" ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/workflow-changes.patch)" == *'name: New upstream CI'* ]]
+echo "PASS later upstream workflow updates require a new explicit review"
 
 setup_case pr_denied
 commit_fork_file
