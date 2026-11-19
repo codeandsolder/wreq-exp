@@ -65,6 +65,15 @@ if [[ "$closed_bodies" == *"$marker"* ]]; then
   exit 0
 fi
 
+# Restore exactly the fork's workflow subtree, including file additions and
+# deletions, without retaining workflow-changing upstream ancestry.
+restore_fork_workflows() {
+  git rm -r -f --ignore-unmatch -- .github/workflows
+  if [[ -n "$(git ls-tree -r --name-only "$base_sha" -- .github/workflows)" ]]; then
+    git restore --source="$base_sha" --staged --worktree -- .github/workflows
+  fi
+}
+
 # Repackage a merged upstream tree into a workflow-free fork commit. The bot
 # can push that commit using contents:write; the upstream snapshot is recorded
 # separately so subsequent runs do not propose already accepted source code.
@@ -74,25 +83,21 @@ flatten_upstream_source() {
     git diff --binary "$workflow_base" "$upstream_sha" -- .github/workflows \
       > .github/upstream-reconciliation/workflow-changes.patch
   fi
-  # Restore the entire fork workflow subtree, including deleted/added files.
-  git rm -r -f --ignore-unmatch -- .github/workflows
-  if [[ -n "$(git ls-tree -r --name-only "$base_sha" -- .github/workflows)" ]]; then
-    git restore --source="$base_sha" --staged --worktree -- .github/workflows
-  fi
+  restore_fork_workflows
   printf '%s\n' "$upstream_sha" > "$SOURCE_CHECKPOINT"
   git add -A .github/upstream-reconciliation
   git reset --soft "$base_sha"
   git commit -m "Reconcile upstream source $(git rev-parse --short=12 upstream/main) without workflow history" >>"$LOG" 2>&1
 }
 
+candidate_is_flattened=false
 open_reconciliation_pr() {
   local reason="$1" old_sha
   old_sha="$(git ls-remote origin "refs/heads/$RECONCILIATION_BRANCH" | cut -f1)"
   git switch --force-create "$RECONCILIATION_BRANCH" HEAD
 
-  if [[ "$workflow_review_required" == true || -n "$reviewed_source" ]]; then
-    # Workflow-changing upstream commits anywhere in the proposed history can
-    # be rejected by GitHub, even when the final tree restores the fork files.
+  if [[ "$candidate_is_flattened" != true && ( "$workflow_review_required" == true || -n "$reviewed_source" ) ]]; then
+    # The original merge path can retain workflow-changing upstream ancestry.
     flatten_upstream_source
   fi
 
@@ -127,69 +132,74 @@ open_reconciliation_pr() {
     --body-file "$BODY"
 }
 
-if ! git merge --no-ff --no-edit upstream/main >"$LOG" 2>&1; then
-  conflict_files="$(git diff --name-only --diff-filter=U || true)"
-  if [[ -z "$conflict_files" ]]; then
-    # Unrelated or rewritten upstream history can fail before Git records any
-    # conflicted paths. Open an explicit manual-work PR rather than silently
-    # dropping either history or treating the problem as a successful sync.
-    git merge --abort >/dev/null 2>&1 || true
-    mkdir -p .github/upstream-reconciliation
-    {
-      printf '# Upstream history requires manual reconciliation\n\n'
-      printf 'Fork base: %s\n\nUpstream commit: %s\n\n' "$base_sha" "$upstream_sha"
-      printf 'Remove this marker after reconciling histories and passing CI.\n'
-    } > .github/upstream-reconciliation/UNMERGEABLE.md
-    git add .github/upstream-reconciliation/UNMERGEABLE.md
-    git commit -m 'Record upstream history that cannot be merged automatically' >>"$LOG" 2>&1
-    open_reconciliation_pr 'Upstream merge failed before creating conflict entries'
+# Build a fork-parented candidate using an explicit, accurate three-way base.
+# This is required for previously reviewed source-only checkpoints (no parent
+# edge to upstream) and for any genuine conflict. Never use `-X ours`: silently
+# choosing the fork's overlapping hunks can drop new upstream changes, while
+# replaying old history can manufacture duplicate definitions and tests.
+create_source_candidate() {
+  local source_base="$1" merge_status=0 merged_tree
+  git merge-tree --write-tree --merge-base="$source_base" \
+    "$base_sha" "$upstream_sha" >"$LOG" 2>&1 || merge_status=$?
+  if (( merge_status > 1 )); then
+    echo "Upstream merge-tree failed (status $merge_status)" >&2
+    cat "$LOG" >&2
+    return "$merge_status"
+  fi
+  merged_tree="$(head -n 1 "$LOG")"
+  if ! [[ "$merged_tree" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Upstream merge returned no valid tree" >&2
+    cat "$LOG" >&2
+    return 2
+  fi
+  # merge-tree records both sides of textual conflicts directly in its result
+  # tree. The draft is intentionally *not* a compilable or auto-mergeable tree
+  # until a human resolves every conflict marker.
+  git read-tree -u --reset "$merged_tree"
+  restore_fork_workflows
+  mkdir -p .github/upstream-reconciliation
+  if [[ "$workflow_review_required" == true ]]; then
+    git diff --binary "$workflow_base" "$upstream_sha" -- .github/workflows \
+      > .github/upstream-reconciliation/workflow-changes.patch
+  fi
+  printf '%s\n' "$upstream_sha" > "$SOURCE_CHECKPOINT"
+  git add -A .github/upstream-reconciliation
+  git commit -m "Propose upstream source $(git rev-parse --short=12 upstream/main) from reviewed merge base" >>"$LOG" 2>&1
+  candidate_is_flattened=true
+  return "$merge_status"
+}
+
+if [[ -n "$reviewed_source" ]]; then
+  if ! create_source_candidate "$reviewed_source"; then
+    open_reconciliation_pr 'Incremental source conflicts; candidate preserves both sides for manual resolution'
     exit 0
   fi
-  git merge --abort
-
-  # Include all clean upstream changes, favor fork hunks in tentative result.
-  if ! git merge --no-ff --no-edit -X ours upstream/main >>"$LOG" 2>&1; then
-    if [[ ! -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
-      echo "Tentative merge failed without an active merge" >&2
-      cat "$LOG" >&2
-      exit 1
+else
+  if ! git merge --no-ff --no-edit upstream/main >"$LOG" 2>&1; then
+    conflict_files="$(git diff --name-only --diff-filter=U || true)"
+    if [[ -z "$conflict_files" ]]; then
+      # Rewritten/unrelated histories may fail without conflicted paths.
+      git merge --abort >/dev/null 2>&1 || true
+      mkdir -p .github/upstream-reconciliation
+      {
+        printf '# Upstream history requires manual reconciliation\n\n'
+        printf 'Fork base: %s\n\nUpstream commit: %s\n\n' "$base_sha" "$upstream_sha"
+        printf 'Remove this marker after reconciling histories and passing CI.\n'
+      } > .github/upstream-reconciliation/UNMERGEABLE.md
+      git add .github/upstream-reconciliation/UNMERGEABLE.md
+      git commit -m 'Record upstream history that cannot be merged automatically' >>"$LOG" 2>&1
+      open_reconciliation_pr 'Upstream merge failed before creating conflict entries'
+      exit 0
     fi
-
-    # Git relocates a fork file to PATH~HEAD when the upstream side has a
-    # directory at PATH. Restoring only the unmerged placeholder would delete
-    # the fork's original file. Remove the colliding upstream subtree first,
-    # then put the fork's original PATH back into the candidate tree.
-    while IFS= read -r path; do
-      if [[ "$path" == *'~HEAD'* ]]; then
-        original="${path%%~HEAD*}"
-        if [[ -n "$original" ]] && git cat-file -e "HEAD:$original" 2>/dev/null; then
-          git rm -r -f --ignore-unmatch -- "$original"
-          git rm -f --ignore-unmatch -- "$path"
-          git restore --source=HEAD --staged --worktree -- "$original"
-        fi
-      fi
-    done <<< "$conflict_files"
-
-    # -X ours also leaves modify/delete, rename/delete and other unmerged
-    # paths. Retain the fork's version of each, including its deletions.
-    while IFS= read -r -d '' path; do
-      if git cat-file -e "HEAD:$path" 2>/dev/null; then
-        git restore --source=HEAD --staged --worktree -- "$path"
-      else
-        git rm -f --ignore-unmatch -- "$path"
-      fi
-    done < <(git diff --name-only --diff-filter=U -z)
-
-    if [[ -n "$(git ls-files -u)" ]]; then
-      echo "Unresolved paths remain after favoring fork versions" >&2
-      git status --short >&2
-      exit 1
+    git merge --abort
+    # A full merge with the actual Git ancestry reported a conflict. Rebuild
+    # a reviewable *fork-parented* tree with all alternatives preserved.
+    if create_source_candidate "$workflow_base"; then
+      echo 'Unexpected clean merge-tree after failed Git merge; manual review required' >>"$LOG"
     fi
-    git commit --no-edit >>"$LOG" 2>&1
+    open_reconciliation_pr 'Upstream source conflicts; candidate preserves both sides for manual resolution'
+    exit 0
   fi
-  printf '\nConflicts in original merge (fork changes preferred in candidate):\n%s\n' "$conflict_files" >>"$LOG"
-  open_reconciliation_pr "Git merge conflicts"
-  exit 0
 fi
 
 # Workflow modifications require a separately authorized review even if the
@@ -197,13 +207,6 @@ fi
 if [[ "$workflow_review_required" == true ]]; then
   open_reconciliation_pr 'Upstream GitHub Actions workflow changes require authorized review'
   exit 0
-fi
-
-# Source-only reconciliations must also flatten later upstream merges: their
-# history still includes deferred workflow commits even if this specific update
-# contains no new workflow changes.
-if [[ -n "$reviewed_source" ]]; then
-  flatten_upstream_source
 fi
 
 # GITHUB_TOKEN pushes do not trigger push CI. Validate all targets first and
