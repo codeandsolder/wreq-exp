@@ -1,11 +1,11 @@
-use std::{net::SocketAddr, pin::Pin};
-
 #[path = "support/tls_cert.rs"]
 mod tls_cert;
 
+use std::{net::SocketAddr, pin::Pin};
+
 use btls::{
     pkey::{PKey, Private},
-    ssl::{Ssl, SslAcceptor, SslMethod},
+    ssl::Ssl,
     x509::X509,
 };
 use tokio::{
@@ -15,10 +15,7 @@ use tokio::{
 use wreq::{Client, tls::trust::CertStore};
 
 async fn serve(cert: &X509, key: &PKey<Private>) -> SocketAddr {
-    let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
-    acceptor.set_certificate(cert).unwrap();
-    acceptor.set_private_key(key).unwrap();
-    let acceptor = acceptor.build();
+    let acceptor = tls_cert::acceptor(cert, key);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -42,7 +39,7 @@ async fn serve(cert: &X509, key: &PKey<Private>) -> SocketAddr {
 
 #[tokio::test]
 async fn verify_host_overrides_uri_host() {
-    let (cert, key) = tls_cert::self_signed("wreq.test", Some("192.0.2.1".parse().unwrap()));
+    let (cert, key) = tls_cert::self_signed("wreq.test", Some([192, 0, 2, 1].into()));
     let der = cert.to_der().unwrap();
     let url = format!("https://{}/", serve(&cert, &key).await);
 
