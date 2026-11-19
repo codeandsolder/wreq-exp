@@ -5,6 +5,7 @@ set -Eeuo pipefail
 # a draft PR. Preserve all fork-specific changes in the proposed tree.
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/0x676e67/wreq.git}"
 RECONCILIATION_BRANCH="automation/upstream-reconciliation"
+SOURCE_CHECKPOINT=".github/upstream-reconciliation/reviewed-source-sha"
 LOG="${RUNNER_TEMP:-/tmp}/wreq-upstream-sync.log"
 BODY="${RUNNER_TEMP:-/tmp}/wreq-upstream-reconciliation.md"
 
@@ -18,10 +19,27 @@ git switch --force-create upstream-sync origin/main
 base_sha="$(git rev-parse origin/main)"
 upstream_sha="$(git rev-parse upstream/main)"
 
+# A manually merged source-only reconciliation has no Git parent edge to
+# upstream: adding that edge would require workflow-write permission. Track
+# the precise upstream source snapshot instead; never mistake it for ancestry.
+reviewed_source=""
+if [[ -f "$SOURCE_CHECKPOINT" ]]; then
+  reviewed_source="$(cat "$SOURCE_CHECKPOINT")"
+  if ! [[ "$reviewed_source" =~ ^[0-9a-f]{40}$ ]] ||
+     ! git merge-base --is-ancestor "$reviewed_source" "$upstream_sha" 2>/dev/null; then
+    echo "Invalid or rewritten upstream source checkpoint: $reviewed_source" >&2
+    exit 1
+  fi
+  if [[ "$reviewed_source" == "$upstream_sha" ]]; then
+    echo "Already reviewed upstream source $upstream_sha; fork workflows remain independently managed"
+    exit 0
+  fi
+fi
+
 # GitHub's workflow file permission is separate from contents:write and cannot
 # be granted to GITHUB_TOKEN. Detect *upstream* workflow edits even when a
 # conflict resolution favors the fork and leaves the final tree unchanged.
-workflow_base="$(git merge-base "$base_sha" "$upstream_sha" || true)"
+workflow_base="${reviewed_source:-$(git merge-base "$base_sha" "$upstream_sha" || true)}"
 workflow_review_required=false
 if [[ -n "$workflow_base" ]] && ! git diff --quiet "$workflow_base" "$upstream_sha" -- .github/workflows; then
   workflow_review_required=true
@@ -47,28 +65,35 @@ if [[ "$closed_bodies" == *"$marker"* ]]; then
   exit 0
 fi
 
+# Repackage a merged upstream tree into a workflow-free fork commit. The bot
+# can push that commit using contents:write; the upstream snapshot is recorded
+# separately so subsequent runs do not propose already accepted source code.
+flatten_upstream_source() {
+  mkdir -p .github/upstream-reconciliation
+  if [[ "$workflow_review_required" == true ]]; then
+    git diff --binary "$workflow_base" "$upstream_sha" -- .github/workflows \
+      > .github/upstream-reconciliation/workflow-changes.patch
+  fi
+  # Restore the entire fork workflow subtree, including deleted/added files.
+  git rm -r -f --ignore-unmatch -- .github/workflows
+  if [[ -n "$(git ls-tree -r --name-only "$base_sha" -- .github/workflows)" ]]; then
+    git restore --source="$base_sha" --staged --worktree -- .github/workflows
+  fi
+  printf '%s\n' "$upstream_sha" > "$SOURCE_CHECKPOINT"
+  git add -A .github/upstream-reconciliation
+  git reset --soft "$base_sha"
+  git commit -m "Reconcile upstream source $(git rev-parse --short=12 upstream/main) without workflow history" >>"$LOG" 2>&1
+}
+
 open_reconciliation_pr() {
   local reason="$1" old_sha
   old_sha="$(git ls-remote origin "refs/heads/$RECONCILIATION_BRANCH" | cut -f1)"
   git switch --force-create "$RECONCILIATION_BRANCH" HEAD
 
-  if [[ "$workflow_review_required" == true ]]; then
-    # A branch containing an upstream workflow-changing commit is rejected even
-    # if a subsequent commit restores that workflow file. Capture the exact
-    # upstream patch, retain the fork's workflows, and propose *one* new commit
-    # based on origin/main without upstream workflow-changing history.
-    mkdir -p .github/upstream-reconciliation
-    git diff --binary "$workflow_base" "$upstream_sha" -- .github/workflows \
-      > .github/upstream-reconciliation/workflow-changes.patch
-    # Replace the candidate workflow subtree with the base tree, accounting
-    # for newly added, modified and removed workflow files alike.
-    git rm -r -f --ignore-unmatch -- .github/workflows
-    if [[ -n "$(git ls-tree -r --name-only "$base_sha" -- .github/workflows)" ]]; then
-      git restore --source="$base_sha" --staged --worktree -- .github/workflows
-    fi
-    git add -A .github/upstream-reconciliation
-    git reset --soft "$base_sha"
-    git commit -m "Propose upstream reconciliation with workflow changes deferred" >>"$LOG" 2>&1
+  if [[ "$workflow_review_required" == true || -n "$reviewed_source" ]]; then
+    # Workflow-changing upstream commits anywhere in the proposed history can
+    # be rejected by GitHub, even when the final tree restores the fork files.
+    flatten_upstream_source
   fi
 
   git push origin "HEAD:refs/heads/$RECONCILIATION_BRANCH" \
@@ -172,6 +197,13 @@ fi
 if [[ "$workflow_review_required" == true ]]; then
   open_reconciliation_pr 'Upstream GitHub Actions workflow changes require authorized review'
   exit 0
+fi
+
+# Source-only reconciliations must also flatten later upstream merges: their
+# history still includes deferred workflow commits even if this specific update
+# contains no new workflow changes.
+if [[ -n "$reviewed_source" ]]; then
+  flatten_upstream_source
 fi
 
 # GITHUB_TOKEN pushes do not trigger push CI. Validate all targets first and
