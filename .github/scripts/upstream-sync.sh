@@ -17,6 +17,15 @@ git switch --force-create upstream-sync origin/main
 
 base_sha="$(git rev-parse origin/main)"
 upstream_sha="$(git rev-parse upstream/main)"
+
+# GitHub's workflow file permission is separate from contents:write and cannot
+# be granted to GITHUB_TOKEN. Detect *upstream* workflow edits even when a
+# conflict resolution favors the fork and leaves the final tree unchanged.
+workflow_base="$(git merge-base "$base_sha" "$upstream_sha" || true)"
+workflow_review_required=false
+if [[ -n "$workflow_base" ]] && ! git diff --quiet "$workflow_base" "$upstream_sha" -- .github/workflows; then
+  workflow_review_required=true
+fi
 if git merge-base --is-ancestor upstream/main HEAD; then
   echo "Already contains upstream $upstream_sha"
   exit 0
@@ -42,6 +51,26 @@ open_reconciliation_pr() {
   local reason="$1" old_sha
   old_sha="$(git ls-remote origin "refs/heads/$RECONCILIATION_BRANCH" | cut -f1)"
   git switch --force-create "$RECONCILIATION_BRANCH" HEAD
+
+  if [[ "$workflow_review_required" == true ]]; then
+    # A branch containing an upstream workflow-changing commit is rejected even
+    # if a subsequent commit restores that workflow file. Capture the exact
+    # upstream patch, retain the fork's workflows, and propose *one* new commit
+    # based on origin/main without upstream workflow-changing history.
+    mkdir -p .github/upstream-reconciliation
+    git diff --binary "$workflow_base" "$upstream_sha" -- .github/workflows \
+      > .github/upstream-reconciliation/workflow-changes.patch
+    # Replace the candidate workflow subtree with the base tree, accounting
+    # for newly added, modified and removed workflow files alike.
+    git rm -r -f --ignore-unmatch -- .github/workflows
+    if [[ -n "$(git ls-tree -r --name-only "$base_sha" -- .github/workflows)" ]]; then
+      git restore --source="$base_sha" --staged --worktree -- .github/workflows
+    fi
+    git add -A .github/upstream-reconciliation
+    git reset --soft "$base_sha"
+    git commit -m "Propose upstream reconciliation with workflow changes deferred" >>"$LOG" 2>&1
+  fi
+
   git push origin "HEAD:refs/heads/$RECONCILIATION_BRANCH" \
     --force-with-lease="refs/heads/$RECONCILIATION_BRANCH:$old_sha"
 
@@ -51,6 +80,17 @@ open_reconciliation_pr() {
     printf '**Reason:** %s\n\n' "$reason"
     printf -- '- Fork base: %s\n- Upstream: %s (https://github.com/0x676e67/wreq/commit/%s)\n\n' "$base_sha" "$upstream_sha" "$upstream_sha"
     printf 'This is an **unverified** candidate. Resolve conflicts and check feature combinations before merging.\n\n'
+    if [[ "$workflow_review_required" == true ]]; then
+      printf '### Workflow changes require a separately authorized update\n\n'
+      # shellcheck disable=SC2016
+      printf 'The scheduled `GITHUB_TOKEN` cannot push changes to `.github/workflows/`. '
+      printf 'The original upstream changes are preserved in '
+      # shellcheck disable=SC2016
+      printf '`.github/upstream-reconciliation/workflow-changes.patch`. '
+      printf 'The proposed branch retains the fork workflow files and has no workflow-changing commits. '
+      printf '**Review and reconcile the patch with a credential authorized to change workflows** (it may conflict with fork workflow files); validate before accepting the sync. '
+      printf 'The draft does not mark upstream history as synchronized.\n\n'
+    fi
     printf 'This branch will not be overwritten while this draft PR is open.\n\n'
     if [[ -s "$LOG" ]]; then
       printf '### Diagnostics (last 100 lines)\n\n'
@@ -124,6 +164,13 @@ if ! git merge --no-ff --no-edit upstream/main >"$LOG" 2>&1; then
   fi
   printf '\nConflicts in original merge (fork changes preferred in candidate):\n%s\n' "$conflict_files" >>"$LOG"
   open_reconciliation_pr "Git merge conflicts"
+  exit 0
+fi
+
+# Workflow modifications require a separately authorized review even if the
+# non-workflow merge is conflict-free. Do not attempt the forbidden main push.
+if [[ "$workflow_review_required" == true ]]; then
+  open_reconciliation_pr 'Upstream GitHub Actions workflow changes require authorized review'
   exit 0
 fi
 
