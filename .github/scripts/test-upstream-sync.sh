@@ -121,6 +121,22 @@ assert_draft() {
   git --git-dir="$origin" rev-parse --verify refs/heads/automation/upstream-reconciliation >/dev/null
 }
 
+# A negated command at top level does not honor set -e. Assert explicitly so
+# a regression cannot silently pass the fixture and continue to the next one.
+assert_blob_absent() {
+  if git --git-dir="$origin" cat-file -e "$1" 2>/dev/null; then
+    echo "Unexpected object in origin: $1" >&2
+    return 1
+  fi
+}
+
+assert_ref_absent() {
+  if git --git-dir="$origin" rev-parse --verify "$1" >/dev/null 2>&1; then
+    echo "Unexpected reference in origin: $1" >&2
+    return 1
+  fi
+}
+
 setup_case noop
 commit_fork_file
 run_sync
@@ -143,7 +159,7 @@ commit_fork_file
 commit_upstream_file
 TEST_FAIL_VALIDATE=1 run_sync
 assert_main_has_fork_only
-! git --git-dir="$origin" cat-file -e main:upstream-only.txt 2>/dev/null
+assert_blob_absent main:upstream-only.txt
 assert_draft
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
 [[ "$(cat "$TEST_PR_BODY")" == *"Synthetic Rust validation failure"* ]]
@@ -196,7 +212,7 @@ git -C "$upstream" commit --quiet -m "upstream modifies obsolete"
 git -C "$upstream" push --quiet origin main
 run_sync
 assert_draft
-! git --git-dir="$origin" cat-file -e automation/upstream-reconciliation:obsolete.txt 2>/dev/null
+assert_blob_absent automation/upstream-reconciliation:obsolete.txt
 [[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
 echo "PASS delete/modify conflict retains fork deletion"
 
@@ -257,7 +273,7 @@ commit_upstream_file
 TEST_EXISTING_PR=99 run_sync
 [[ ! -f "$TEST_CARGO_CALLS" ]]
 [[ ! -f "$TEST_PR_BODY" ]]
-! git --git-dir="$origin" rev-parse --verify refs/heads/automation/upstream-reconciliation >/dev/null 2>&1
+assert_ref_absent refs/heads/automation/upstream-reconciliation
 assert_main_has_fork_only
 echo "PASS pending reconciliation PR is not overwritten"
 
@@ -267,7 +283,7 @@ commit_upstream_file
 candidate="<!-- upstream-sync:base=$(git -C "$work" rev-parse HEAD);upstream=$(git -C "$upstream" rev-parse HEAD) -->"
 TEST_CLOSED_PR_BODY="$candidate" run_sync
 [[ ! -f "$TEST_PR_BODY" ]]
-! git --git-dir="$origin" cat-file -e main:upstream-only.txt 2>/dev/null
+assert_blob_absent main:upstream-only.txt
 echo "PASS closed PR is not recreated for unchanged upstream and main"
 
 setup_case closed_stale
@@ -277,6 +293,64 @@ TEST_CLOSED_PR_BODY='<!-- upstream-sync:base=old;upstream=old -->' TEST_FAIL_VAL
 assert_draft
 echo "PASS new upstream/base fingerprint permits fresh reconciliation"
 
+# Simulate GitHub's refusal of newly pushed commits touching workflows,
+# including changes hidden by a later restoring commit.
+install_workflow_push_guard() {
+  cat > "$origin/hooks/pre-receive" <<'WORKFLOW_GUARD'
+#!/usr/bin/env bash
+set -euo pipefail
+while read -r old new ref; do
+  [[ "$ref" == refs/heads/automation/upstream-reconciliation ]] || continue
+  while read -r commit; do
+    if [[ -n "$(git diff-tree --no-commit-id --name-only -r "$commit" -- .github/workflows)" ]]; then
+      echo "reject workflow-changing commit: $commit" >&2
+      exit 1
+    fi
+  done < <(git rev-list "$new" --not refs/heads/main)
+done
+WORKFLOW_GUARD
+  chmod +x "$origin/hooks/pre-receive"
+}
+
+setup_case new_workflow
+commit_fork_file
+commit_upstream_file
+mkdir -p "$upstream/.github/workflows"
+printf 'name: Upstream CI\n' > "$upstream/.github/workflows/ci.yml"
+git -C "$upstream" add .github/workflows
+git -C "$upstream" commit --quiet -m 'upstream adds workflow'
+git -C "$upstream" push --quiet origin main
+install_workflow_push_guard
+run_sync
+assert_draft
+assert_blob_absent automation/upstream-reconciliation:.github/workflows/ci.yml
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/workflow-changes.patch)" == *'name: Upstream CI'* ]]
+[[ "$(cat "$TEST_PR_BODY")" == *'authorized to change workflows'* ]]
+assert_blob_absent main:upstream-only.txt
+echo "PASS workflow-adding upstream becomes pushable draft with full patch and unchanged main"
+
+setup_case conflicting_workflow
+commit_fork_file
+mkdir -p "$work/.github/workflows" "$upstream/.github/workflows"
+printf 'name: Fork CI\n' > "$work/.github/workflows/ci.yml"
+git -C "$work" add .github/workflows
+git -C "$work" commit --quiet -m 'fork adds workflow'
+git -C "$work" push --quiet origin main
+commit_upstream_file
+printf 'name: Upstream CI\n' > "$upstream/.github/workflows/ci.yml"
+git -C "$upstream" add .github/workflows
+git -C "$upstream" commit --quiet -m 'upstream adds conflicting workflow'
+git -C "$upstream" push --quiet origin main
+install_workflow_push_guard
+run_sync
+assert_draft
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/workflows/ci.yml)" == 'name: Fork CI' ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:upstream-only.txt)" == upstream ]]
+[[ "$(git --git-dir="$origin" show automation/upstream-reconciliation:.github/upstream-reconciliation/workflow-changes.patch)" == *'name: Upstream CI'* ]]
+[[ "$(cat "$TEST_PR_BODY")" == *'Git merge conflicts'* ]]
+echo "PASS workflow conflict retains fork workflow and upstream patch without blocked commit history"
+
 setup_case pr_denied
 commit_fork_file
 commit_upstream_file
@@ -285,7 +359,7 @@ TEST_FAIL_VALIDATE=1 TEST_GH_CREATE_FAIL=1 run_sync
 ret=$?
 set -e
 [[ "$ret" -ne 0 ]]
-! git --git-dir="$origin" cat-file -e main:upstream-only.txt 2>/dev/null
+assert_blob_absent main:upstream-only.txt
 echo "PASS failed PR creation fails the workflow rather than claiming success"
 
 echo "All upstream-follow Git fixtures passed"
