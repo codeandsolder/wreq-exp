@@ -40,7 +40,7 @@ jobs:
           toolchain: 1.99.0
           components: clippy
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
       - name: Format fork package
         run: cargo +nightly fmt -p wreq -- --check
@@ -51,7 +51,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
   full-style:
     name: Full style / feature lint
@@ -68,7 +68,7 @@ jobs:
           go-version: stable
           cache: false
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
       - name: Clippy all targets and features
         run: cargo +1.99.0 clippy --locked -p wreq --all-targets --all-features -- -D warnings
@@ -83,7 +83,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
   emulation-profiles:
     name: Vendored browser profile compatibility
@@ -94,14 +94,14 @@ jobs:
         with:
           toolchain: 1.99.0
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
       - name: Verify browser profiles against current Wreq TLS/H2 APIs
         run: cargo +1.99.0 test --manifest-path vendor/wreq-util/Cargo.toml --features tokio-rt --test profile_wire_compat
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
   docs:
     name: Docs
@@ -117,14 +117,14 @@ jobs:
           go-version: stable
           cache: false
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
       - name: Build docs
         run: cargo +1.99.0 doc --locked -p wreq --document-private-items --all-features
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
   test:
     name: Test feature group (${{ matrix.group }})
@@ -164,7 +164,7 @@ jobs:
         with:
           toolchain: 1.99.0
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
       - uses: actions/setup-go@v7
         if: matrix.group == 'runtime'
@@ -194,7 +194,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
   build:
     name: Build (${{ matrix.env }})
@@ -210,7 +210,7 @@ jobs:
         with:
           toolchain: 1.99.0
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
 
       - uses: actions/setup-go@v7
         with:
@@ -242,4 +242,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@6c75050a784dea5e37d28b094ce9ef3ef6c40829 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
