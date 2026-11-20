@@ -1,122 +1,102 @@
-use std::{error::Error as StdError, io};
+#[path = "support/tls_cert.rs"]
+mod tls_cert;
+#[path = "support/tls_server.rs"]
+mod tls_server;
 
 use wreq::{
-    Client, retry,
+    Client,
     tls::{TlsInfo, trust::CertStore},
 };
 
-fn badssl_connection_reset_retry_policy() -> retry::Policy {
-    retry::Policy::default()
-        .max_retries_per_request(10)
-        .no_budget()
-        .classify_fn(|req_rep| {
-            if req_rep.error().is_some_and(is_connection_reset) {
-                req_rep.retryable()
-            } else {
-                req_rep.success()
-            }
-        })
-}
-
-fn is_connection_reset(err: &(dyn StdError + 'static)) -> bool {
-    let mut source = Some(err);
-
-    while let Some(err) = source {
-        if let Some(io) = err.downcast_ref::<io::Error>()
-            && io.kind() == io::ErrorKind::ConnectionReset
-        {
-            return true;
-        }
-
-        source = err.source();
-    }
-
-    false
-}
-
 #[tokio::test]
-async fn test_badssl_modern() {
-    let text = Client::builder()
+async fn test_modern_tls_with_local_certificate() {
+    let (cert, key) = tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+    let store = CertStore::builder()
+        .add_der_cert(&cert.to_der().unwrap())
+        .build()
+        .unwrap();
+
+    let response = Client::builder()
+        .tls_cert_store(store)
         .no_proxy()
-        .retry(badssl_connection_reset_retry_policy())
         .build()
         .unwrap()
-        .get("https://mozilla-modern.badssl.com/")
+        .get(&url)
         .send()
-        .await
-        .unwrap()
-        .text()
         .await
         .unwrap();
 
-    assert!(text.contains("<title>mozilla-modern.badssl.com</title>"));
+    assert!(response.status().is_success());
 }
 
 #[tokio::test]
-async fn test_badssl_self_signed() {
-    let text = Client::builder()
+async fn test_self_signed_certificate_verification_override() {
+    let (cert, key) = tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+
+    let response = Client::builder()
         .tls_cert_verification(false)
         .no_proxy()
-        .retry(badssl_connection_reset_retry_policy())
         .build()
         .unwrap()
-        .get("https://self-signed.badssl.com/")
+        .get(&url)
         .send()
-        .await
-        .unwrap()
-        .text()
         .await
         .unwrap();
 
-    assert!(text.contains("<title>self-signed.badssl.com</title>"));
+    assert!(response.status().is_success());
 }
 
 #[tokio::test]
-async fn test_badssl_wrong_host() {
-    let text = Client::builder()
+async fn test_tls_hostname_verification_override() {
+    let (cert, key) = tls_cert::self_signed("expected.example", None);
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+    let der = cert.to_der().unwrap();
+
+    let client = |verify_hostname| {
+        Client::builder()
+            .tls_cert_store(CertStore::builder().add_der_cert(&der).build().unwrap())
+            .tls_verify_hostname(verify_hostname)
+            .no_proxy()
+            .build()
+            .unwrap()
+    };
+
+    // The certificate is trusted, but only names expected.example, not 127.0.0.1.
+    assert!(
+        client(false)
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert!(client(true).get(&url).send().await.is_err());
+
+    // Skipping hostname matching does not skip certificate-chain verification.
+    let untrusted = Client::builder()
         .tls_verify_hostname(false)
         .no_proxy()
-        .retry(badssl_connection_reset_retry_policy())
         .build()
-        .unwrap()
-        .get("https://wrong.host.badssl.com/")
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
         .unwrap();
-
-    assert!(text.contains("<title>wrong.host.badssl.com</title>"));
-
-    let result = Client::builder()
-        .tls_verify_hostname(false)
-        .no_proxy()
-        .build()
-        .unwrap()
-        .get("https://self-signed.badssl.com/")
-        .send()
-        .await;
-
-    assert!(result.is_err());
+    assert!(untrusted.get(&url).send().await.is_err());
 }
 
 #[tokio::test]
 async fn test_tls_self_signed_cert() {
+    let (cert, key) = tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+
     let client = Client::builder()
         .tls_cert_verification(false)
         .tls_info(true)
-        .retry(badssl_connection_reset_retry_policy())
         .no_proxy()
         .build()
         .unwrap();
 
-    let resp = client
-        .get("https://self-signed.badssl.com/")
-        .send()
-        .await
-        .unwrap();
-
+    let resp = client.get(&url).send().await.unwrap();
     let peer_cert_der = resp
         .extensions()
         .get::<TlsInfo>()
@@ -130,18 +110,18 @@ async fn test_tls_self_signed_cert() {
 
     let client = Client::builder()
         .tls_cert_store(self_signed_cert_store)
-        .retry(badssl_connection_reset_retry_policy())
         .no_proxy()
         .build()
         .unwrap();
 
-    let resp = client
-        .get("https://self-signed.badssl.com/")
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
+    assert!(client.get(&url).send().await.unwrap().status().is_success());
 
-    let res = client.get("https://www.google.com").send().await;
-    assert!(res.is_err());
+    // A different self-signed cert is not trusted even at the same hostname.
+    let (other_cert, other_key) =
+        tls_cert::self_signed("localhost", Some("127.0.0.1".parse().unwrap()));
+    let other_url = format!(
+        "https://{}/",
+        tls_server::serve(&other_cert, &other_key).await
+    );
+    assert!(client.get(&other_url).send().await.is_err());
 }

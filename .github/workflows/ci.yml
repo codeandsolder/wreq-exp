@@ -24,6 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install ripgrep for upstream reconciliation fixtures
+        run: |
+          if ! command -v rg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
       - name: Verify upstream reconciliation scenarios
         run: bash .github/scripts/test-upstream-sync.sh
       - uses: dtolnay/rust-toolchain@nightly
@@ -58,6 +64,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy all targets and features
         run: cargo +1.99.0 clippy --locked -p wreq --all-targets --all-features -- -D warnings
+      # Reuse the same runner, compiler setup, and incremental target for the
+      # ordinary PR build and docs instead of provisioning two more runners.
+      - name: Build all features (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo +1.99.0 build --locked -p wreq --all-features
+      - name: Build documentation (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo +1.99.0 doc --locked -p wreq --document-private-items --all-features
 
   emulation-profiles:
     name: Vendored browser profile compatibility
@@ -73,7 +87,7 @@ jobs:
 
   docs:
     name: Docs
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -89,29 +103,37 @@ jobs:
         run: cargo +1.99.0 doc --locked -p wreq --document-private-items --all-features
 
   test:
-    name: Test (${{ matrix.feature-set }})
+    name: Test feature group (${{ matrix.group }})
     if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 4
+      # Reuse each runner's Cargo build artifacts for five feature variants.
+      # All 15 prior test configurations remain covered.
       matrix:
-        feature-set:
-          - ""
-          - "--no-default-features --features tokio-rt,webpki-roots"
-          - "--features compio-rt"
-          - "--all-features"
-          - "--features form"
-          - "--features query"
-          - "--features cookies"
-          - "--features gzip,stream"
-          - "--features brotli,stream"
-          - "--features zstd,stream"
-          - "--features deflate,stream"
-          - "--features json"
-          - "--features multipart"
-          - "--features stream"
-          - "--features hickory-dns"
+        include:
+          - group: runtime
+            feature-sets: |
+              default
+              --no-default-features --features tokio-rt,webpki-roots
+              --features compio-rt
+              --all-features
+              --features hickory-dns
+          - group: request
+            feature-sets: |
+              --features form
+              --features query
+              --features cookies
+              --features json
+              --features multipart
+          - group: compression
+            feature-sets: |
+              --features gzip,stream
+              --features brotli,stream
+              --features zstd,stream
+              --features deflate,stream
+              --features stream
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -119,19 +141,34 @@ jobs:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v7
-        if: matrix.feature-set == '--all-features'
+        if: matrix.group == 'runtime'
         with:
           go-version: stable
           cache: false
       - uses: taiki-e/install-action@v2.87.17
         with:
           tool: cargo-nextest
-      - name: Run tests (${{ matrix.feature-set }})
-        run: cargo +1.99.0 nextest run -p wreq ${{ matrix.feature-set }}
+      - name: Run tests (${{ matrix.group }})
+        shell: bash
+        env:
+          FEATURE_SETS: ${{ matrix.feature-sets }}
+        run: |
+          while IFS= read -r flags; do
+            # Nextest has no --default-features flag; omitting a feature
+            # selector is its default-feature configuration.
+            if [[ "$flags" == default ]]; then
+              feature_args=()
+            else
+              read -r -a feature_args <<< "$flags"
+            fi
+            echo "::group::nextest $flags"
+            cargo +1.99.0 nextest run -p wreq --locked "${feature_args[@]}"
+            echo "::endgroup::"
+          done <<< "$FEATURE_SETS"
 
   build:
     name: Build (${{ matrix.env }})
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     environment: ${{ matrix.env }}
     strategy:
