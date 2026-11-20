@@ -1,3 +1,8 @@
+#[path = "support/tls_cert.rs"]
+mod tls_cert;
+#[path = "support/tls_server.rs"]
+mod tls_server;
+
 use std::{error::Error as StdError, io};
 
 use wreq::{
@@ -72,33 +77,39 @@ async fn test_badssl_self_signed() {
 }
 
 #[tokio::test]
-async fn test_badssl_wrong_host() {
-    let text = Client::builder()
+async fn test_tls_hostname_verification_override() {
+    let (cert, key) = tls_cert::self_signed("expected.example", None);
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+    let der = cert.to_der().unwrap();
+
+    let client = |verify_hostname| {
+        Client::builder()
+            .tls_cert_store(CertStore::builder().add_der_cert(&der).build().unwrap())
+            .tls_verify_hostname(verify_hostname)
+            .no_proxy()
+            .build()
+            .unwrap()
+    };
+
+    // The certificate is trusted, but only names expected.example, not 127.0.0.1.
+    assert!(
+        client(false)
+            .get(&url)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    assert!(client(true).get(&url).send().await.is_err());
+
+    // Skipping hostname matching does not skip certificate-chain verification.
+    let untrusted = Client::builder()
         .tls_verify_hostname(false)
         .no_proxy()
-        .retry(badssl_connection_reset_retry_policy())
         .build()
-        .unwrap()
-        .get("https://wrong.host.badssl.com/")
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
         .unwrap();
-
-    assert!(text.contains("<title>wrong.host.badssl.com</title>"));
-
-    let result = Client::builder()
-        .tls_verify_hostname(false)
-        .no_proxy()
-        .build()
-        .unwrap()
-        .get("https://self-signed.badssl.com/")
-        .send()
-        .await;
-
-    assert!(result.is_err());
+    assert!(untrusted.get(&url).send().await.is_err());
 }
 
 #[tokio::test]
