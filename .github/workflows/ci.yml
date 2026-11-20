@@ -24,6 +24,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Install ripgrep for upstream reconciliation fixtures
+        run: |
+          if ! command -v rg >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
       - name: Verify upstream reconciliation scenarios
         run: bash .github/scripts/test-upstream-sync.sh
       - uses: dtolnay/rust-toolchain@nightly
