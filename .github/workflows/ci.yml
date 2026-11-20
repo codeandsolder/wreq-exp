@@ -109,7 +109,7 @@ jobs:
         include:
           - group: runtime
             feature-sets: |
-              --default-features
+              default
               --no-default-features --features tokio-rt,webpki-roots
               --features compio-rt
               --all-features
@@ -148,7 +148,13 @@ jobs:
           FEATURE_SETS: ${{ matrix.feature-sets }}
         run: |
           while IFS= read -r flags; do
-            read -r -a feature_args <<< "$flags"
+            # Nextest has no --default-features flag; omitting a feature
+            # selector is its default-feature configuration.
+            if [[ "$flags" == default ]]; then
+              feature_args=()
+            else
+              read -r -a feature_args <<< "$flags"
+            fi
             echo "::group::nextest $flags"
             cargo +1.99.0 nextest run -p wreq --locked "${feature_args[@]}"
             echo "::endgroup::"
