@@ -31,7 +31,9 @@ jobs:
         with:
           toolchain: 1.99.0
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
+
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -40,3 +42,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/upstream-sync.sh
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
