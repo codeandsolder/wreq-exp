@@ -2,47 +2,24 @@ name: Follow upstream
 
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "47 3 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
-
-concurrency:
-  group: upstream-follow
-  cancel-in-progress: false
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: true
-      - name: Verify upstream reconciliation scenarios
-        run: bash .github/scripts/test-upstream-sync.sh
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.99.0
-          components: clippy
-      - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
-
-      - uses: actions/setup-go@v7
-        with:
-          go-version: stable
-          cache: false
-      - name: Sync upstream or open a reconciliation PR
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/upstream-sync.sh
-
-      - name: Finalize mandatory sccache
-        if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9d478bdbfd4acd0e1a2c015d1ff1d11688eda572 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/upstream-tracking.yml@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+    with:
+      upstream-repository: 0x676e67/wreq
+      upstream-branch: main
+      target-branch: main
+      strategy: source-merge
+      rust-toolchain: "1.99.0"
+      nightly-format: true
+      go: true
+      validation-script: .github/scripts/validate-upstream.sh
+      timeout-minutes: 60
