@@ -1,39 +1,71 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>codeandsolder/ci-workflows:renovate-fleet"],
+  "extends": [
+    "github>codeandsolder/ci-workflows:renovate-fleet"
+  ],
   "timezone": "Europe/Warsaw",
   "dependencyDashboard": true,
-  "schedule": ["before 6am on monday"],
+  "schedule": [
+    "before 6am on monday"
+  ],
   "prConcurrentLimit": 10,
-  "ignorePaths": ["vendor/**"],
+  "ignorePaths": [
+    "vendor/**"
+  ],
   "packageRules": [
     {
       "description": "Maintain fork-specific telemetry patches in vendored transport crates",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["http2", "netty"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchPackageNames": [
+        "http2",
+        "netty"
+      ],
       "enabled": false
     },
     {
       "description": "Group routine Rust dependency updates",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
       "groupName": "Rust dependencies"
     },
     {
       "description": "Group routine GitHub Actions updates",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest",
+        "pin",
+        "pinDigest"
+      ],
       "groupName": "GitHub Actions"
     },
     {
       "description": "Keep major dependency upgrades isolated for review",
-      "matchUpdateTypes": ["major"],
+      "matchUpdateTypes": [
+        "major"
+      ],
       "dependencyDashboardApproval": true
     },
     {
       "description": "Keep Rust toolchain action updates separate from other Actions",
-      "matchPackageNames": ["dtolnay/rust-toolchain"],
+      "matchPackageNames": [
+        "dtolnay/rust-toolchain"
+      ],
       "groupName": "Rust toolchain"
     }
-  ]
+  ],
+  "forkProcessing": "enabled"
 }
