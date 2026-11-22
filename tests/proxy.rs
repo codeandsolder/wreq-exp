@@ -1,12 +1,8 @@
 mod support;
-use std::{env, sync::LazyLock};
+use std::{env, process::Command, time::Duration};
 
 use support::server;
-use tokio::sync::Mutex;
 use wreq::Client;
-
-// serialize tests that read from / write to environment variables
-static HTTP_PROXY_ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[tokio::test]
 async fn http_proxy() {
@@ -107,13 +103,70 @@ async fn http_proxy_basic_auth_parsed() {
     assert_eq!(res.status(), wreq::StatusCode::OK);
 }
 
+// Run the real process-environment contract in a separate libtest process.
+// A lock around set_var cannot protect unrelated readers (including libraries).
+// Remove inherited proxy settings and CGI detection before installing the
+// selected proxy. A nonmatching NO_PROXY also overrides Windows' system list.
+fn run_system_proxy_child(proxy: &str) {
+    let mut command = Command::new(env::current_exe().unwrap());
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
+    ] {
+        command.env_remove(name);
+    }
+    let output = command
+        .env("http_proxy", proxy)
+        .env("NO_PROXY", "unrelated.invalid")
+        .args(["--exact", "system_proxy_child", "--ignored", "--nocapture"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "system proxy child failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+const SYSTEM_PROXY_URL: &str = "http://proxy-test.invalid/prox";
+
 #[tokio::test]
-async fn system_http_proxy_basic_auth_parsed() {
-    let url = "http://hyper.rs.local/prox";
+#[ignore = "child process entry point for the system proxy contract tests"]
+async fn system_proxy_child() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let res = Client::builder()
+            .build()
+            .unwrap()
+            .get(SYSTEM_PROXY_URL)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.uri(), SYSTEM_PROXY_URL);
+        assert_eq!(res.status(), wreq::StatusCode::OK);
+
+        let res = wreq::get(SYSTEM_PROXY_URL).send().await.unwrap();
+        assert_eq!(res.uri(), SYSTEM_PROXY_URL);
+        assert_eq!(res.status(), wreq::StatusCode::OK);
+    })
+    .await
+    .expect("system proxy requests must complete");
+}
+
+#[test]
+fn system_http_proxy_basic_auth_parsed() {
     let server = server::http(move |req| {
         assert_eq!(req.method(), "GET");
-        assert_eq!(req.uri(), url);
-        assert_eq!(req.headers()["host"], "hyper.rs.local");
+        assert_eq!(req.uri(), SYSTEM_PROXY_URL);
+        assert_eq!(req.headers()["host"], "proxy-test.invalid");
         assert_eq!(
             req.headers()["proxy-authorization"],
             "Basic QWxhZGRpbjpvcGVuc2VzYW1l"
@@ -121,39 +174,7 @@ async fn system_http_proxy_basic_auth_parsed() {
 
         async { http::Response::default() }
     });
-
-    // avoid races with other tests that change "http_proxy"
-    let _env_lock = HTTP_PROXY_ENV_MUTEX.lock().await;
-
-    // save system setting first.
-    let system_proxy = env::var("http_proxy");
-
-    // set-up http proxy.
-    unsafe {
-        env::set_var(
-            "http_proxy",
-            format!("http://Aladdin:opensesame@{}", server.addr()),
-        )
-    }
-
-    let res = Client::builder()
-        .build()
-        .unwrap()
-        .get(url)
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(res.uri(), url);
-    assert_eq!(res.status(), wreq::StatusCode::OK);
-
-    // reset user setting.
-    unsafe {
-        match system_proxy {
-            Err(_) => env::remove_var("http_proxy"),
-            Ok(proxy) => env::set_var("http_proxy", proxy),
-        }
-    }
+    run_system_proxy_child(&format!("http://Aladdin:opensesame@{}", server.addr()));
 }
 
 #[tokio::test]
@@ -182,39 +203,17 @@ async fn test_no_proxy() {
     assert_eq!(res.status(), wreq::StatusCode::OK);
 }
 
-#[tokio::test]
-async fn test_using_system_proxy() {
-    let url = "http://not.a.real.sub.hyper.rs.local/prox";
+#[test]
+fn test_using_system_proxy() {
     let server = server::http(move |req| {
         assert_eq!(req.method(), "GET");
-        assert_eq!(req.uri(), url);
-        assert_eq!(req.headers()["host"], "not.a.real.sub.hyper.rs.local");
+        assert_eq!(req.uri(), SYSTEM_PROXY_URL);
+        assert_eq!(req.headers()["host"], "proxy-test.invalid");
+        assert!(!req.headers().contains_key("proxy-authorization"));
 
         async { http::Response::default() }
     });
-
-    // avoid races with other tests that change "http_proxy"
-    let _env_lock = HTTP_PROXY_ENV_MUTEX.lock().await;
-
-    // save system setting first.
-    let system_proxy = env::var("http_proxy");
-    // set-up http proxy.
-    unsafe {
-        env::set_var("http_proxy", format!("http://{}", server.addr()));
-    }
-    // system proxy is used by default
-    let res = wreq::get(url).send().await.unwrap();
-
-    assert_eq!(res.uri(), url);
-    assert_eq!(res.status(), wreq::StatusCode::OK);
-
-    // reset user setting.
-    unsafe {
-        match system_proxy {
-            Err(_) => env::remove_var("http_proxy"),
-            Ok(proxy) => env::set_var("http_proxy", proxy),
-        }
-    }
+    run_system_proxy_child(&format!("http://{}", server.addr()));
 }
 
 #[tokio::test]
