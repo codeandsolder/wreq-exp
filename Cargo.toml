@@ -400,5 +400,6 @@ path = "examples/unix_socket.rs"
 http2 = { path = "vendor/http2" }
 netty = { path = "vendor/netty" }
 
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
 [workspace]
 exclude = ["vendor/http2", "vendor/netty", "vendor/wreq-util"]
