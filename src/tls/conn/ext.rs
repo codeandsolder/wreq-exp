@@ -64,8 +64,8 @@ impl SslConnectorBuilderExt for SslConnectorBuilder {
                         #[cfg(feature = "native-roots")]
                         {
                             let native = rustls_native_certs::load_native_certs();
-                            for error in native.errors {
-                                warn!("failed to load native trust root: {error}");
+                            for _error in native.errors {
+                                warn!("failed to load native trust root: {_error}");
                             }
                             roots.extend(
                                 native.certs.into_iter().map(|cert| cert.as_ref().to_vec()),
