@@ -1,15 +1,29 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>codeandsolder/ci-workflows:renovate-upstream-fork"],
+  "extends": [
+    "github>codeandsolder/ci-workflows:renovate-upstream-fork",
+    "github>codeandsolder/cargo-patches:renovate-consumer"
+  ],
   "forkProcessing": "enabled",
-  "enabledManagers": ["github-actions", "cargo"],
+  "enabledManagers": [
+    "github-actions",
+    "cargo"
+  ],
   "packageRules": [
     {
       "description": "Maintain only the fork-owned BTLS Git pin; keep all three crates on one revision",
-      "matchManagers": ["cargo"],
-      "matchDatasources": ["git-refs"],
-      "matchPackageNames": ["/^https:\\\\/\\\\/github\\\\.com\\\\/codeandsolder\\\\/btls-fast(?:\\\\.git)?$/"],
-      "matchUpdateTypes": ["digest"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDatasources": [
+        "git-refs"
+      ],
+      "matchPackageNames": [
+        "/^https:\\/\\/github\\.com\\/codeandsolder\\/btls-fast(?:\\.git)?$/"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
       "enabled": true,
       "groupName": "BTLS git family",
       "groupSlug": "btls-git-family",
@@ -18,13 +32,36 @@
     },
     {
       "description": "Maintain the fork-owned zlib-rs-fast Git pin",
-      "matchManagers": ["cargo"],
-      "matchDatasources": ["git-refs"],
-      "matchPackageNames": ["/^https:\\\\/\\\\/github\\\\.com\\\\/codeandsolder\\\\/zlib-rs-fast(?:\\\\.git)?$/"],
-      "matchUpdateTypes": ["digest"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDatasources": [
+        "git-refs"
+      ],
+      "matchPackageNames": [
+        "/^https:\\/\\/github\\.com\\/codeandsolder\\/zlib-rs-fast(?:\\.git)?$/"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
       "enabled": true,
       "automerge": true,
       "automergeType": "pr"
+    },
+    {
+      "description": "Maintain the fork-owned Wreq transport patch tags as one family",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDatasources": [
+        "github-tags"
+      ],
+      "matchPackageNames": [
+        "codeandsolder/cargo-patches"
+      ],
+      "matchCurrentValue": "/^wreq-transport-v/",
+      "enabled": true,
+      "automerge": false
     }
   ]
 }
