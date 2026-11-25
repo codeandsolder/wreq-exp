@@ -363,7 +363,7 @@ impl TlsConnectorBuilder {
             .map_err(Error::tls)?
             .set_identity(self.identity.as_ref())?
             .set_cert_store(self.cert_store.as_ref())?
-            .set_cert_verification(self.cert_verification)
+            .set_cert_verification(self.cert_verification)?
             .set_cert_compressors(opts.certificate_compressors.as_deref())?;
 
         // The specification distinguishes an empty requested list from omitting the extension.
