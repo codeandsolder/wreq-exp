@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>codeandsolder/ci-workflows:renovate-fleet"
+    "github>codeandsolder/ci-workflows:renovate-fleet",
+    "github>codeandsolder/cargo-patches:renovate-consumer"
   ],
   "timezone": "Europe/Warsaw",
   "dependencyDashboard": true,
@@ -22,7 +23,10 @@
         "pin",
         "pinDigest"
       ],
-      "groupName": "Rust dependencies"
+      "groupName": "Rust dependencies",
+      "matchPackageNames": [
+        "!codeandsolder/cargo-patches"
+      ]
     },
     {
       "description": "Group routine GitHub Actions updates",
@@ -51,26 +55,6 @@
         "dtolnay/rust-toolchain"
       ],
       "groupName": "Rust toolchain"
-    },
-    {
-      "description": "Advance the HTTP/2 and Netty publication atomically; exclude other patch families",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchDatasources": [
-        "github-tags"
-      ],
-      "matchPackageNames": [
-        "codeandsolder/cargo-patches"
-      ],
-      "matchDepNames": [
-        "http2",
-        "netty"
-      ],
-      "versioning": "semver",
-      "groupName": "Wreq transport patch family",
-      "groupSlug": "wreq-transport-patch-family",
-      "versionCompatibility": "^(?<compatibility>wreq-transport-v)(?<version>\\d+\\.\\d+\\.\\d+)$"
     }
   ]
 }

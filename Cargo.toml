@@ -397,8 +397,6 @@ name = "unix_socket"
 path = "examples/unix_socket.rs"
 
 [patch.crates-io]
-http2 = { git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1" }
-netty = { git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1" }
 
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
 [workspace]
