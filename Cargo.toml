@@ -104,7 +104,7 @@ prefix-symbols = ["btls/prefix-symbols"]
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"
-http2 = { version = "0.5.20", path = "vendor/http2", optional = true }
+http2 = { version = "0.5.20", git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1", optional = true }
 httparse = "1.10.1"
 http-body = "1.0.1"
 http-body-util = "0.1.4"
@@ -120,7 +120,7 @@ tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
-netty = { version = "0.2.5", path = "vendor/netty", default-features = false }
+netty = { version = "0.2.5", git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1", default-features = false }
 tower = { version = "0.5.3", default-features = false, features = [
     "timeout",
     "util",
@@ -397,9 +397,8 @@ name = "unix_socket"
 path = "examples/unix_socket.rs"
 
 [patch.crates-io]
-http2 = { path = "vendor/http2" }
-netty = { path = "vendor/netty" }
+http2 = { git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1" }
+netty = { git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1" }
 
 zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
 [workspace]
-exclude = ["vendor/http2", "vendor/netty", "vendor/wreq-util"]
