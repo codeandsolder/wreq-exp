@@ -10,7 +10,7 @@ authors = ["0x676e67 <gngppz@gmail.com>"]
 readme = "README.md"
 license = "Apache-2.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 include = ["/README.md", "/LICENSE", "/src/**/*.rs"]
 
 [package.metadata.docs.rs]
@@ -104,6 +104,7 @@ parking_lot = ["dep:parking_lot", "http2?/parking_lot"]
 prefix-symbols = ["btls/prefix-symbols"]
 
 [dependencies]
+base64 = "0.23"
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"

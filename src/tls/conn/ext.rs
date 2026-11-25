@@ -44,8 +44,8 @@ impl SslConnectorBuilderExt for SslConnectorBuilder {
 
     fn set_cert_store(mut self, store: Option<&CertStore>) -> crate::Result<SslConnectorBuilder> {
         if let Some(store) = store {
-            self.set_cert_store(store.0.as_ref().clone())
-                .map_err(Error::tls)?
+            btls::ssl::SslContextBuilder::set_cert_store(&mut self, store.0.as_ref().clone())
+                .map_err(Error::tls)?;
         } else {
             #[cfg(any(
                 feature = "chromium-roots",
@@ -90,7 +90,7 @@ impl SslConnectorBuilderExt for SslConnectorBuilder {
                         DEFAULT_CERT_STORE.get_or_init(|| store)
                     }
                 };
-                self.set_cert_store(store.0.as_ref().clone())
+                btls::ssl::SslContextBuilder::set_cert_store(&mut self, store.0.as_ref().clone())
                     .map_err(Error::tls)?;
             }
 

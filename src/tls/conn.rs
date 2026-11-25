@@ -409,15 +409,6 @@ impl TlsConnectorBuilder {
             SslOptions::NO_PSK_DHE_KE
         );
 
-        // Set TLS No Renegotiation options
-        set_bool!(
-            opts,
-            !renegotiation,
-            connector,
-            set_options,
-            SslOptions::NO_RENEGOTIATION
-        );
-
         // Set TLS grease options
         set_option!(opts, grease_enabled, connector, set_grease_enabled);
 
