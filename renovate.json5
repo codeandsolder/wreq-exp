@@ -1,7 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "github>codeandsolder/ci-workflows:renovate-fleet"
+    "github>codeandsolder/ci-workflows:renovate-fleet",
+    "github>codeandsolder/cargo-patches:renovate-consumer"
   ],
   "timezone": "Europe/Warsaw",
   "dependencyDashboard": true,
@@ -9,21 +10,7 @@
     "before 6am on monday"
   ],
   "prConcurrentLimit": 10,
-  "ignorePaths": [
-    "vendor/**"
-  ],
   "packageRules": [
-    {
-      "description": "Maintain fork-specific telemetry patches in vendored transport crates",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchPackageNames": [
-        "http2",
-        "netty"
-      ],
-      "enabled": false
-    },
     {
       "description": "Group routine Rust dependency updates",
       "matchManagers": [
@@ -36,7 +23,10 @@
         "pin",
         "pinDigest"
       ],
-      "groupName": "Rust dependencies"
+      "groupName": "Rust dependencies",
+      "matchPackageNames": [
+        "!codeandsolder/cargo-patches"
+      ]
     },
     {
       "description": "Group routine GitHub Actions updates",

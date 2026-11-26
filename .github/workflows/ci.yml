@@ -85,7 +85,7 @@ jobs:
         uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
 
   emulation-profiles:
-    name: Vendored browser profile compatibility
+    name: Patched browser profile compatibility
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -102,7 +102,11 @@ jobs:
           rust-toolchain: "${{ steps.compiler.outputs.channel }}"
 
       - name: Verify browser profiles against current Wreq TLS/H2 APIs
-        run: cargo test --manifest-path vendor/wreq-util/Cargo.toml --features tokio-rt --test profile_wire_compat
+        run: |
+          profiles=$(mktemp -d)
+          trap 'rm -rf "$profiles"' EXIT
+          git clone --quiet --depth 1 --branch wreq-util-v0.0.1 https://github.com/codeandsolder/cargo-patches.git "$profiles"
+          cargo --config "patch.\"https://github.com/codeandsolder/wreq-exp.git\".wreq.path = \"$GITHUB_WORKSPACE\"" test --manifest-path "$profiles/wreq-util/Cargo.toml" --features tokio-rt --test profile_wire_compat
 
       - name: Finalize mandatory sccache
         if: always()
