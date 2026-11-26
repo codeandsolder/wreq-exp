@@ -18,7 +18,6 @@ jobs:
       target-branch: main
       workflow-policy: preserve
       rust-toolchain: repository
-      nightly-format: true
       go: true
       validation-script: .github/scripts/validate-upstream.sh
       timeout-minutes: 60
