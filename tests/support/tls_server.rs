@@ -21,6 +21,11 @@ use super::tls_cert;
 pub async fn serve(cert: &X509, key: &PKey<Private>) -> SocketAddr {
     let acceptor = tls_cert::acceptor(cert, key);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    start(listener, acceptor)
+}
+
+/// Serves TLS with a caller-configured acceptor (for example TLS 1.3 only).
+pub fn start(listener: TcpListener, acceptor: btls::ssl::SslAcceptor) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
