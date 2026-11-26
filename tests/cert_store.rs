@@ -155,7 +155,8 @@ async fn self_signed_certificate_requires_explicit_trust() {
 async fn dns_only_certificate_rejects_ip_uri_unless_hostname_verification_is_disabled() {
     let (cert, key) = tls_cert::self_signed("expected.example", None);
     let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
-    let store = CertStore::from_der_certs([cert.to_der().unwrap()]).unwrap();
+    let der = cert.to_der().unwrap();
+    let store = CertStore::from_der_certs([&der]).unwrap();
     let trusted = || Client::builder().tls_cert_store(store.clone());
     assert_verification_failure(send(trusted(), &url).await);
     assert!(
