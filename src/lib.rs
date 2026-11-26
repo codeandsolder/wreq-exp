@@ -243,6 +243,8 @@
 //!   `getaddrinfo`.
 //! - **chromium-roots**: Load static Chromium Root Store certificates.
 //! - **webpki-roots** *(enabled by default)*: Load static Mozilla root certificates.
+//! - **native-roots**: Load the operating system trust roots, merging them with any enabled bundled
+//!   root stores. An explicit client certificate store takes precedence.
 //! - **system-proxy**: Enable system proxy support.
 //! - **tracing**: Enable tracing logging support.
 //! - **prefix-symbols**: Prefix BoringSSL symbols to avoid OpenSSL conflicts.
