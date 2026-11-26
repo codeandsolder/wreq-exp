@@ -1,61 +1,63 @@
 {
-  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": [
-    "github>codeandsolder/ci-workflows:renovate-fleet",
-    "github>codeandsolder/cargo-patches:renovate-consumer"
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: [
+    'github>codeandsolder/ci-workflows:renovate-fleet',
+    'github>codeandsolder/cargo-patches:renovate-consumer',
   ],
-  "timezone": "Europe/Warsaw",
-  "dependencyDashboard": true,
-  "schedule": [
-    "before 6am on monday"
+  timezone: 'Europe/Warsaw',
+  dependencyDashboard: {
+    enabled: true,
+  },
+  schedule: [
+    'before 6am on monday',
   ],
-  "prConcurrentLimit": 10,
-  "packageRules": [
+  prConcurrentLimit: 10,
+  packageRules: [
     {
-      "description": "Group routine Rust dependency updates",
-      "matchManagers": [
-        "cargo"
+      description: 'Group routine Rust dependency updates',
+      matchManagers: [
+        'cargo',
       ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "digest",
-        "pin",
-        "pinDigest"
+      matchUpdateTypes: [
+        'minor',
+        'patch',
+        'digest',
+        'pin',
+        'pinDigest',
       ],
-      "groupName": "Rust dependencies",
-      "matchPackageNames": [
-        "!codeandsolder/cargo-patches"
-      ]
+      groupName: 'Rust dependencies',
+      matchPackageNames: [
+        '!codeandsolder/cargo-patches',
+      ],
     },
     {
-      "description": "Group routine GitHub Actions updates",
-      "matchManagers": [
-        "github-actions"
+      description: 'Group routine GitHub Actions updates',
+      matchManagers: [
+        'github-actions',
       ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "digest",
-        "pin",
-        "pinDigest"
+      matchUpdateTypes: [
+        'minor',
+        'patch',
+        'digest',
+        'pin',
+        'pinDigest',
       ],
-      "groupName": "GitHub Actions"
+      groupName: 'GitHub Actions',
     },
     {
-      "description": "Keep major dependency upgrades isolated for review",
-      "matchUpdateTypes": [
-        "major"
+      description: 'Keep major dependency upgrades isolated for review',
+      matchUpdateTypes: [
+        'major',
       ],
-      "dependencyDashboardApproval": true
+      dependencyDashboardApproval: true,
     },
     {
-      "description": "Keep Rust toolchain action updates separate from other Actions",
-      "matchPackageNames": [
-        "dtolnay/rust-toolchain"
+      description: 'Keep Rust toolchain action updates separate from other Actions',
+      matchPackageNames: [
+        'dtolnay/rust-toolchain',
       ],
-      "groupName": "Rust toolchain"
-    }
+      groupName: 'Rust toolchain',
+    },
   ],
-  "forkProcessing": "enabled"
+  forkProcessing: 'enabled',
 }
