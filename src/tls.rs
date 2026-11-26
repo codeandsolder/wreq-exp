@@ -22,7 +22,7 @@ use compress::CertificateCompressor;
 pub struct TlsInfo {
     pub(crate) peer_certificate: Option<Bytes>,
     pub(crate) peer_certificate_chain: Option<Vec<Bytes>>,
-    pub(crate) protocol_version: &'static str,
+    pub(crate) protocol_version: Option<&'static str>,
     pub(crate) cipher_suite: Option<&'static str>,
     pub(crate) negotiated_group: Option<&'static str>,
     pub(crate) alpn_protocol: Option<Bytes>,
@@ -46,7 +46,7 @@ impl TlsInfo {
 
     /// Get the negotiated TLS protocol version (for example `TLSv1.3`).
     #[must_use]
-    pub fn protocol_version(&self) -> &'static str {
+    pub fn protocol_version(&self) -> Option<&'static str> {
         self.protocol_version
     }
 
@@ -320,11 +320,6 @@ pub struct TlsOptions {
     /// **Default:** `None`
     pub server_padding: Option<u16>,
 
-    /// Enables TLS renegotiation by sending the `renegotiation_info` extension.
-    ///
-    /// **Default:** `true`
-    pub renegotiation: bool,
-
     /// Delegated Credentials ([RFC 9345](https://datatracker.ietf.org/doc/html/rfc9345)).
     ///
     /// Allows TLS 1.3 endpoints to use temporary delegated credentials
@@ -507,13 +502,6 @@ impl TlsOptionsBuilder {
         self
     }
 
-    /// Sets the renegotiation flag.
-    #[inline]
-    pub fn renegotiation(mut self, enabled: bool) -> Self {
-        self.config.renegotiation = enabled;
-        self
-    }
-
     /// Sets the delegated credentials.
     #[inline]
     pub fn delegated_credentials<T>(mut self, creds: T) -> Self
@@ -660,7 +648,6 @@ impl Default for TlsOptions {
             psk_dhe_ke: true,
             pre_shared_key: false,
             psk_skip_session_ticket: false,
-            renegotiation: true,
             delegated_credentials: None,
             curves_list: None,
             sigalgs_list: None,

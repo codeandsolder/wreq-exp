@@ -18,7 +18,7 @@ pub fn self_signed(host: &str, ip: Option<IpAddr>) -> (X509, PKey<Private>) {
 
     let mut name = X509NameBuilder::new().unwrap();
     name.append_entry_by_nid(Nid::COMMONNAME, host).unwrap();
-    let name = name.build();
+    let name = name.build().unwrap();
 
     let mut builder = X509::builder().unwrap();
     builder.set_version(2).unwrap();
