@@ -118,9 +118,9 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.19.0"
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
-btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "0fddfc535515622963dfb4cb658ab63dcfa5307d" }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a0cccd60709091822287f0e395e1398aa132ed87" }
+btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a0cccd60709091822287f0e395e1398aa132ed87" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a0cccd60709091822287f0e395e1398aa132ed87" }
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
