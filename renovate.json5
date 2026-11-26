@@ -35,5 +35,6 @@
       "matchPackageNames": ["dtolnay/rust-toolchain"],
       "groupName": "Rust toolchain"
     }
-  ]
+  ],
+  "forkProcessing": "enabled"
 }
