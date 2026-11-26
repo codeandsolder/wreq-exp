@@ -259,7 +259,7 @@ dependencies = [
 [[package]]
 name = "btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a0cccd60709091822287f0e395e1398aa132ed87#a0cccd60709091822287f0e395e1398aa132ed87"
 dependencies = [
  "bitflags",
  "btls-sys",
@@ -271,12 +271,10 @@ dependencies = [
 [[package]]
 name = "btls-sys"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a0cccd60709091822287f0e395e1398aa132ed87#a0cccd60709091822287f0e395e1398aa132ed87"
 dependencies = [
  "bindgen",
  "cmake",
- "fs_extra",
- "fslock",
 ]
 
 [[package]]
@@ -1132,16 +1130,6 @@ name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
-
-[[package]]
-name = "fslock"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
-dependencies = [
- "libc",
- "winapi",
-]
 
 [[package]]
 name = "futures"
@@ -3202,7 +3190,7 @@ dependencies = [
 [[package]]
 name = "tokio-btls"
 version = "0.5.6"
-source = "git+https://github.com/codeandsolder/btls-fast.git?rev=91fb0b88c9895f97c37f39a2db265742575a8096#91fb0b88c9895f97c37f39a2db265742575a8096"
+source = "git+https://github.com/codeandsolder/btls-fast.git?rev=a0cccd60709091822287f0e395e1398aa132ed87#a0cccd60709091822287f0e395e1398aa132ed87"
 dependencies = [
  "btls",
  "btls-sys",
@@ -3963,6 +3951,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "wreq"
 version = "0.16.1"
 dependencies = [
+ "base64 0.23.1",
  "brotli 9.1.3",
  "btls",
  "btls-sys",
@@ -3996,6 +3985,7 @@ dependencies = [
  "pretty_env_logger",
  "psl",
  "reqwest",
+ "rustls-native-certs",
  "send_wrapper",
  "serde",
  "serde_html_form",

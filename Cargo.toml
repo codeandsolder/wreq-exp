@@ -10,7 +10,7 @@ authors = ["0x676e67 <gngppz@gmail.com>"]
 readme = "README.md"
 license = "Apache-2.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 include = ["/README.md", "/LICENSE", "/src/**/*.rs"]
 
 [package.metadata.docs.rs]
@@ -84,6 +84,9 @@ ws = ["dep:tokio-tungstenite", "tokio-tungstenite?/handshake"]
 # Use static Mozilla root certificates for TLS verification (default).
 webpki-roots = ["dep:webpki-root-certs"]
 
+# Merge the OS trust store with any enabled bundled root stores.
+native-roots = ["dep:rustls-native-certs"]
+
 # Use static Chromium Root Store certificates for TLS verification.
 chromium-roots = ["dep:chromium-roots"]
 
@@ -101,6 +104,7 @@ parking_lot = ["dep:parking_lot", "http2?/parking_lot"]
 prefix-symbols = ["btls/prefix-symbols"]
 
 [dependencies]
+base64 = "0.23"
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"
@@ -114,9 +118,9 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.19.0"
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096" }
-btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "91fb0b88c9895f97c37f39a2db265742575a8096" }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a0cccd60709091822287f0e395e1398aa132ed87" }
+btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a0cccd60709091822287f0e395e1398aa132ed87" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a0cccd60709091822287f0e395e1398aa132ed87" }
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
@@ -146,6 +150,7 @@ sync_wrapper = { version = "1.0.2", optional = true }
 
 ## webpki root certs
 webpki-root-certs = { version = "1.0.7", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 ## Chromium root certs
 chromium-roots = { version = "0.1.1", optional = true }

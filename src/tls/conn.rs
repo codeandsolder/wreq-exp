@@ -218,7 +218,7 @@ impl TlsConnector {
         if self.settings.ech_grease.is_some() {
             cfg.set_enable_ech_grease(true);
             // NSS sizes name padding from the URL host, even for IPs or when SNI is disabled.
-            cfg.set_ex_data(host_length_index()?, host.len());
+            cfg.set_ex_data(host_length_index()?, host.len())?;
         }
 
         if let Some(ref cache) = self.cache {
@@ -236,7 +236,7 @@ impl TlsConnector {
             }
 
             let idx = key_index()?;
-            cfg.set_ex_data(idx, key);
+            cfg.set_ex_data(idx, key)?;
         }
 
         let mut ssl = cfg.into_ssl(host)?;
@@ -363,7 +363,7 @@ impl TlsConnectorBuilder {
             .map_err(Error::tls)?
             .set_identity(self.identity.as_ref())?
             .set_cert_store(self.cert_store.as_ref())?
-            .set_cert_verification(self.cert_verification)
+            .set_cert_verification(self.cert_verification)?
             .set_cert_compressors(opts.certificate_compressors.as_deref())?;
 
         // The specification distinguishes an empty requested list from omitting the extension.
@@ -407,15 +407,6 @@ impl TlsConnectorBuilder {
             connector,
             set_options,
             SslOptions::NO_PSK_DHE_KE
-        );
-
-        // Set TLS No Renegotiation options
-        set_bool!(
-            opts,
-            !renegotiation,
-            connector,
-            set_options,
-            SslOptions::NO_RENEGOTIATION
         );
 
         // Set TLS grease options
@@ -465,15 +456,18 @@ impl TlsConnectorBuilder {
             && policy != EchGrease::Default
         {
             connector
-                .set_ech_grease_callback(move |ssl, info| ech_grease_parameters(policy, ssl, info));
+                .set_ech_grease_callback(move |ssl, info| ech_grease_parameters(policy, ssl, info))
+                .map_err(Error::tls)?;
         }
 
         // Set TLS keylog handler.
         if let Some(ref policy) = self.keylog {
             let handle = policy.clone().handle().map_err(Error::tls)?;
-            connector.set_keylog_callback(move |_, line| {
-                handle.write(line);
-            });
+            connector
+                .set_keylog_callback(move |_, line| {
+                    handle.write(line);
+                })
+                .map_err(Error::tls)?;
         }
 
         // Create the handshake settings with the default session cache capacity.
@@ -490,21 +484,25 @@ impl TlsConnectorBuilder {
         };
 
         // If the session cache is disabled, we don't need to set up any callbacks.
-        let cache = opts.pre_shared_key.then(|| {
+        let cache = if opts.pre_shared_key {
             let session_cache = self.session_cache.clone();
 
             connector.set_session_cache_mode(SslSessionCacheMode::CLIENT);
-            connector.set_new_session_callback({
-                let cache = session_cache.clone();
-                move |ssl, session| {
-                    if let Ok(Some(key)) = key_index().map(|idx| ssl.ex_data(idx)) {
-                        cache.put(key.clone(), TlsSession(session));
+            connector
+                .set_new_session_callback({
+                    let cache = session_cache.clone();
+                    move |ssl, session| {
+                        if let Ok(Some(key)) = key_index().map(|idx| ssl.ex_data(idx)) {
+                            cache.put(key.clone(), TlsSession(session));
+                        }
                     }
-                }
-            });
+                })
+                .map_err(Error::tls)?;
 
-            session_cache
-        });
+            Some(session_cache)
+        } else {
+            None
+        };
 
         Ok(TlsConnector {
             ssl: connector.build(),

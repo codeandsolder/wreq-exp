@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(info) = tls {
                     println!(
                         "tls={} cipher={:?} group={:?} alpn={:?} resumed={}",
-                        info.protocol_version(),
+                        info.protocol_version().unwrap_or("unknown"),
                         info.cipher_suite(),
                         info.negotiated_group(),
                         info.alpn_protocol().map(String::from_utf8_lossy),

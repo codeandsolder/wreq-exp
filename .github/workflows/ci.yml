@@ -42,6 +42,8 @@ jobs:
         run: cargo clippy --locked -p wreq --lib -- -D warnings
       - name: Test default library
         run: cargo test --locked -p wreq --lib
+      - name: Test native trust without bundled roots
+        run: cargo test --locked -p wreq --no-default-features --features tokio-rt,native-roots --test cert_store
 
       - name: Finalize mandatory sccache
         if: always()
