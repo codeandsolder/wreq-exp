@@ -1,40 +1,67 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>codeandsolder/ci-workflows:renovate-fleet"],
-  "timezone": "Europe/Warsaw",
-  "dependencyDashboard": true,
-  "schedule": ["before 6am on monday"],
-  "prConcurrentLimit": 10,
-  "ignorePaths": ["vendor/**"],
+  "extends": [
+    "github>codeandsolder/ci-workflows:renovate-upstream-fork",
+    "github>codeandsolder/cargo-patches:renovate-consumer"
+  ],
+  "forkProcessing": "enabled",
+  "enabledManagers": [
+    "github-actions",
+    "cargo"
+  ],
   "packageRules": [
     {
-      "description": "Keep the vendored transport stack pinned until it is rebased deliberately",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["http2", "wreq-proto", "wreq-rt"],
-      "enabled": false
+      "description": "Maintain only the fork-owned BTLS Git pin; keep all three crates on one revision",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDatasources": [
+        "git-refs"
+      ],
+      "matchPackageNames": [
+        "/^https:\\/\\/github\\.com\\/codeandsolder\\/btls-fast(?:\\.git)?$/"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "enabled": true,
+      "groupName": "BTLS git family",
+      "groupSlug": "btls-git-family",
+      "automerge": true,
+      "automergeType": "pr"
     },
     {
-      "description": "Group routine Rust dependency updates",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
-      "groupName": "Rust dependencies"
+      "description": "Maintain the fork-owned zlib-rs-fast Git pin",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDatasources": [
+        "git-refs"
+      ],
+      "matchPackageNames": [
+        "/^https:\\/\\/github\\.com\\/codeandsolder\\/zlib-rs-fast(?:\\.git)?$/"
+      ],
+      "matchUpdateTypes": [
+        "digest"
+      ],
+      "enabled": true,
+      "automerge": true,
+      "automergeType": "pr"
     },
     {
-      "description": "Group routine GitHub Actions updates",
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest", "pin", "pinDigest"],
-      "groupName": "GitHub Actions"
-    },
-    {
-      "description": "Keep major dependency upgrades isolated for review",
-      "matchUpdateTypes": ["major"],
-      "dependencyDashboardApproval": true
-    },
-    {
-      "description": "Keep Rust toolchain action updates separate from other Actions",
-      "matchPackageNames": ["dtolnay/rust-toolchain"],
-      "groupName": "Rust toolchain"
+      "description": "Maintain the fork-owned Wreq transport patch tags as one family",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchDatasources": [
+        "github-tags"
+      ],
+      "matchPackageNames": [
+        "codeandsolder/cargo-patches"
+      ],
+      "matchCurrentValue": "/^wreq-transport-v/",
+      "enabled": true,
+      "automerge": false
     }
-  ],
-  "forkProcessing": "enabled"
+  ]
 }

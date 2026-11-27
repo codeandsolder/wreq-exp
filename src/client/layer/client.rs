@@ -39,6 +39,8 @@ use {
 };
 
 use self::lazy::{Started as Lazy, lazy};
+#[cfg(feature = "http2")]
+use crate::http2_info::Http2Info;
 use crate::{
     client::layer::config::RequestOptions,
     config::RequestConfig,
@@ -48,7 +50,6 @@ use crate::{
         proxy,
     },
     error::ProxyConnect,
-    http2_info::Http2Info,
     rt::{Executor, Timer},
 };
 
@@ -368,14 +369,18 @@ where
         }
 
         let send_result = pooled.try_send_request(req).await;
+        #[cfg(feature = "http2")]
         let http2_info = pooled.http2_info();
         let mut res = match send_result {
             Ok(res) => res,
             Err(mut err) => {
+                #[cfg(feature = "http2")]
                 let connect_info = match http2_info {
                     Some(info) => pooled.conn_info.clone().extra(info),
                     None => pooled.conn_info.clone(),
                 };
+                #[cfg(not(feature = "http2"))]
+                let connect_info = pooled.conn_info.clone();
                 return if let Some(req) = err.take_message() {
                     Err(TrySendError::Retryable {
                         connection_reused: pooled.is_reused(),
@@ -392,6 +397,7 @@ where
             }
         };
 
+        #[cfg(feature = "http2")]
         if let Some(info) = http2_info {
             res.extensions_mut().insert(info);
         }
@@ -802,18 +808,11 @@ impl<B> PoolClient<B> {
         }
     }
 
+    #[cfg(feature = "http2")]
     fn http2_info(&self) -> Option<Http2Info> {
         match &self.tx {
             PoolTx::Http1(_) => None,
-            PoolTx::Http2(tx) => {
-                let peer = tx.remote_initial_settings();
-                Some(Http2Info::from_settings(
-                    tx.local_initial_settings(),
-                    peer.as_ref(),
-                    tx.remote_first_connection_window_update(),
-                    tx.remote_initial_settings_ack_received(),
-                ))
-            }
+            PoolTx::Http2(tx) => Some(Http2Info::from_observation(tx.http2_observation())),
         }
     }
 }

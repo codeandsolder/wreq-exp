@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   pull_request:
     paths-ignore:
       - "docs/**"
       - "*.md"
-      - ".github/**"
       - "README.md"
   workflow_dispatch:
 
@@ -19,146 +19,228 @@ permissions:
   contents: read
 
 jobs:
-  style:
-    name: Style
+  quick:
+    name: Quick gate (native nightly)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: nightly
-          override: true
-          components: rustfmt, clippy
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: clippy,rustfmt
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+        with:
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+
+      - name: Format fork package
+        run: cargo fmt -p wreq -- --check
+      - name: Clippy default library
+        run: cargo clippy --locked -p wreq --lib -- -D warnings
+      - name: Test default library
+        run: cargo test --locked -p wreq --lib
+      - name: Test native trust without bundled roots
+        run: cargo test --locked -p wreq --no-default-features --features tokio-rt,native-roots --test cert_store
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+
+  full-style:
+    name: Full style / feature lint
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: clippy,rustfmt
       - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
-      - name: Style check
-        run: cargo fmt --all -- --check
-      - name: Clippy check
-        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+        with:
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+
+      - name: Clippy all targets and features
+        run: cargo clippy --locked -p wreq --all-targets --all-features -- -D warnings
+      # Reuse the same runner, compiler setup, and incremental target for the
+      # ordinary PR build and docs instead of provisioning two more runners.
+      - name: Build all features (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo build --locked -p wreq --all-features
+      - name: Build documentation (PR)
+        if: github.event_name == 'pull_request'
+        run: cargo doc --locked -p wreq --document-private-items --all-features
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
 
   emulation-profiles:
     name: Patched browser profile compatibility
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@v2
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: clippy,rustfmt
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+        with:
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+
       - name: Verify browser profiles against current Wreq TLS/H2 APIs
         run: |
           profiles=$(mktemp -d)
           trap 'rm -rf "$profiles"' EXIT
           git clone --quiet --depth 1 --branch wreq-util-v0.0.1 https://github.com/codeandsolder/cargo-patches.git "$profiles"
-          cargo +1.99.0 --config "patch.\"https://github.com/codeandsolder/wreq-exp.git\".wreq.path = \"$GITHUB_WORKSPACE\"" test --manifest-path "$profiles/wreq-util/Cargo.toml" --features tokio-rt --test profile_wire_compat
+          cargo --config "patch.\"https://github.com/codeandsolder/wreq-exp.git\".wreq.path = \"$GITHUB_WORKSPACE\"" test --manifest-path "$profiles/wreq-util/Cargo.toml" --features tokio-rt --test profile_wire_compat
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
 
   docs:
     name: Docs
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: stable
-          override: true
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: clippy,rustfmt
       - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache: false
-      - name: Build docs
-        run: cargo doc --document-private-items --all-features
-
-  msrv:
-    name: MSRV
-    needs: [style]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve MSRV aware dependencies
-        run: |
-          # A full update would move branch-based Git dependencies past the lockfile.
-          if ! grep -Eq '^source = "git[+][^"]+[?]branch=' Cargo.lock; then
-            cargo update
-          fi
-        env:
-          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
-      - name: Get MSRV package metadata
-        id: metadata
-        run: cargo metadata --no-deps --format-version 1 | jq -r '"msrv=" + .packages[0].rust_version' >> $GITHUB_OUTPUT
-      - name: Install rust (${{ steps.metadata.outputs.msrv }})
-        uses: dtolnay/rust-toolchain@master
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
         with:
-          toolchain: ${{ steps.metadata.outputs.msrv }}
-      - uses: Swatinem/rust-cache@v2
-      - name: Check
-        run: cargo check --locked
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+
+      - name: Build docs
+        run: cargo doc --locked -p wreq --document-private-items --all-features
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
 
   test:
-    name: Test (${{ matrix.feature-set }})
+    name: Test feature group (${{ matrix.group }})
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 4
+      # Reuse each runner's Cargo build artifacts for five feature variants.
+      # All 15 prior test configurations remain covered.
       matrix:
-        feature-set:
-          - "" # default (tokio-rt)
-          - "--no-default-features --features tokio-rt,webpki-roots" # HTTP/1 only
-          - "--features compio-rt"
-          - "--all-features"
-          - "--features form"
-          - "--features query"
-          - "--features cookies"
-          - "--features gzip,stream"
-          - "--features brotli,stream"
-          - "--features zstd,stream"
-          - "--features deflate,stream"
-          - "--features json"
-          - "--features multipart"
-          - "--features stream"
-          - "--features hickory-dns"
+        include:
+          - group: runtime
+            feature-sets: |
+              default
+              --no-default-features --features tokio-rt,webpki-roots
+              --features compio-rt
+              --all-features
+              --features hickory-dns
+          - group: request
+            feature-sets: |
+              --features form
+              --features query
+              --features cookies
+              --features json
+              --features multipart
+          - group: compression
+            feature-sets: |
+              --features gzip,stream
+              --features brotli,stream
+              --features zstd,stream
+              --features deflate,stream
+              --features stream
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: stable
-          override: true
-      - uses: Swatinem/rust-cache@v2
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: clippy,rustfmt
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+        with:
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+
       - uses: actions/setup-go@v7
-        if: matrix.feature-set == '--all-features'
+        if: matrix.group == 'runtime'
         with:
           go-version: stable
           cache: false
-      - uses: taiki-e/install-action@v2.87.24
+      - uses: taiki-e/install-action@v2.87.17
         with:
           tool: cargo-nextest
-      - name: Run tests (${{ matrix.feature-set }})
-        run: cargo nextest run --workspace ${{ matrix.feature-set }}
+      - name: Run tests (${{ matrix.group }})
+        shell: bash
+        env:
+          FEATURE_SETS: ${{ matrix.feature-sets }}
+        run: |
+          while IFS= read -r flags; do
+            # Nextest has no --default-features flag; omitting a feature
+            # selector is its default-feature configuration.
+            if [[ "$flags" == default ]]; then
+              feature_args=()
+            else
+              read -r -a feature_args <<< "$flags"
+            fi
+            echo "::group::nextest $flags"
+            cargo nextest run -p wreq --locked "${feature_args[@]}"
+            echo "::endgroup::"
+          done <<< "$FEATURE_SETS"
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
 
   build:
     name: Build (${{ matrix.env }})
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ${{ matrix.os }}
     environment: ${{ matrix.env }}
     strategy:
       matrix:
-        include:
-          - os: ubuntu-latest
-            env: Linux
-          - os: windows-latest
-            env: Windows
-          - os: macos-latest
-            env: macOS
-          - os: ubuntu-latest
-            env: Android
+        include: ${{ fromJSON(startsWith(github.ref, 'refs/tags/v') && '[{"os":"ubuntu-latest","env":"Linux"},{"os":"windows-latest","env":"Windows"},{"os":"macos-latest","env":"macOS"},{"os":"ubuntu-latest","env":"Android"}]' || '[{"os":"ubuntu-latest","env":"Linux"}]') }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions-rs/toolchain@v1
+      - name: Resolve native quarantined Rust
+        id: compiler
+        uses: codeandsolder/ci-workflows/.github/actions/resolve-rust-toolchain@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: stable
-          override: true
+          toolchain: "${{ steps.compiler.outputs.channel }}"
+          components: clippy,rustfmt
+      - name: Setup mandatory sccache
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main
+        with:
+          rust-toolchain: "${{ steps.compiler.outputs.channel }}"
+
       - uses: actions/setup-go@v7
         with:
           go-version: stable
@@ -168,7 +250,7 @@ jobs:
         run: choco install nasm -y
       - name: Build
         if: matrix.env != 'Android'
-        run: cargo build --all-features
+        run: cargo build --locked -p wreq --all-features
       - name: Add Android targets
         if: matrix.env == 'Android'
         run: rustup target add aarch64-linux-android x86_64-linux-android
@@ -184,5 +266,9 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          cargo install cargo-ndk
-          cargo ndk -t arm64-v8a -t x86_64 build --all-features
+          cargo install cargo-ndk --locked
+          cargo ndk -t arm64-v8a -t x86_64 build -p wreq --all-features
+
+      - name: Finalize mandatory sccache
+        if: always()
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@436a7b79fe974fd4e7549c945eefbb9b00c2522b # main

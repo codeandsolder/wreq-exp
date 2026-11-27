@@ -1,51 +1,17 @@
 #[path = "support/tls_cert.rs"]
 mod tls_cert;
+#[path = "support/tls_server.rs"]
+mod tls_server;
 
-use std::{net::SocketAddr, pin::Pin};
-
-use btls::{
-    pkey::{PKey, Private},
-    ssl::Ssl,
-    x509::X509,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use btls::{pkey::PKey, x509::X509};
+use tokio::net::TcpListener;
 use wreq::{Client, tls::trust::CertStore};
-
-async fn serve(cert: &X509, key: &PKey<Private>) -> SocketAddr {
-    let acceptor = tls_cert::acceptor(cert, key);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    start_tls_server(listener, acceptor)
-}
-
-fn start_tls_server(listener: TcpListener, acceptor: btls::ssl::SslAcceptor) -> SocketAddr {
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((tcp, _)) = listener.accept().await {
-            let ssl = Ssl::new(acceptor.context()).unwrap();
-            let mut stream = tokio_btls::SslStream::new(ssl, tcp).unwrap();
-            tokio::spawn(async move {
-                if Pin::new(&mut stream).accept().await.is_ok() {
-                    let mut buf = [0; 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                        .await;
-                }
-            });
-        }
-    });
-    addr
-}
 
 #[tokio::test]
 async fn verify_host_overrides_uri_host() {
-    let (cert, key) = tls_cert::self_signed("wreq.test", [192, 0, 2, 1].into());
+    let (cert, key) = tls_cert::self_signed("wreq.test", Some([192, 0, 2, 1].into()));
     let der = cert.to_der().unwrap();
-    let url = format!("https://{}/", serve(&cert, &key).await);
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
 
     let get = |host: &'static str| {
         let store = CertStore::builder()
@@ -66,6 +32,24 @@ async fn verify_host_overrides_uri_host() {
     assert!(get("wreq.test").await.unwrap().status().is_success());
     assert!(get("192.0.2.1").await.unwrap().status().is_success());
     assert!(get("other.test").await.is_err());
+}
+
+// Exercise the native-only root feature rather than relying on bundled roots.
+#[cfg(feature = "native-roots")]
+#[tokio::test]
+async fn native_roots_build_client_and_reject_unknown_self_signed_certificate() {
+    let (cert, key) = tls_cert::self_signed("localhost", Some([127, 0, 0, 1].into()));
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+    let client = Client::builder().no_proxy().build().unwrap();
+    assert!(client.get(&url).send().await.is_err());
+    let der = cert.to_der().unwrap();
+    let store = CertStore::from_der_certs([&der]).unwrap();
+    let client = Client::builder()
+        .no_proxy()
+        .tls_cert_store(store)
+        .build()
+        .unwrap();
+    assert!(client.get(&url).send().await.unwrap().status().is_success());
 }
 
 async fn send(builder: wreq::ClientBuilder, url: &str) -> wreq::Result<wreq::Response> {
@@ -98,7 +82,7 @@ async fn ca_issued_certificate_verifies_over_tls13() {
         .set_min_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("https://{}/", start_tls_server(listener, acceptor.build()));
+    let url = format!("https://{}/", tls_server::start(listener, acceptor.build()));
 
     assert_verification_failure(send(Client::builder(), &url).await);
     let store = CertStore::builder()
@@ -115,8 +99,8 @@ async fn ca_issued_certificate_verifies_over_tls13() {
 async fn self_signed_certificate_requires_explicit_trust() {
     use wreq::tls::TlsInfo;
 
-    let (cert, key) = tls_cert::self_signed("wreq.test", [127, 0, 0, 1].into());
-    let addr = serve(&cert, &key).await;
+    let (cert, key) = tls_cert::self_signed("wreq.test", Some([127, 0, 0, 1].into()));
+    let addr = tls_server::serve(&cert, &key).await;
     let url = format!("https://{addr}/");
 
     assert_verification_failure(send(Client::builder(), &url).await);
@@ -161,8 +145,25 @@ async fn self_signed_certificate_requires_explicit_trust() {
     assert!(response.status().is_success());
 
     // Both certificates cover loopback, but the trust store contains only the first.
-    let (other_cert, other_key) = tls_cert::self_signed("wreq.test", addr.ip());
-    let other_addr = serve(&other_cert, &other_key).await;
+    let (other_cert, other_key) = tls_cert::self_signed("wreq.test", Some(addr.ip()));
+    let other_addr = tls_server::serve(&other_cert, &other_key).await;
     let other_url = format!("https://{other_addr}/");
     assert_verification_failure(send(Client::builder().tls_cert_store(store), &other_url).await);
+}
+
+#[tokio::test]
+async fn dns_only_certificate_rejects_ip_uri_unless_hostname_verification_is_disabled() {
+    let (cert, key) = tls_cert::self_signed("expected.example", None);
+    let url = format!("https://{}/", tls_server::serve(&cert, &key).await);
+    let der = cert.to_der().unwrap();
+    let store = CertStore::from_der_certs([&der]).unwrap();
+    let trusted = || Client::builder().tls_cert_store(store.clone());
+    assert_verification_failure(send(trusted(), &url).await);
+    assert!(
+        send(trusted().tls_verify_hostname(false), &url)
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
 }

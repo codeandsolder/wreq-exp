@@ -72,7 +72,7 @@ async fn test_unix_socket() {
 async fn test_proxy_unix_socket() {
     let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream.local_addr().unwrap();
-    let (cert, key) = tls_cert::self_signed("localhost", upstream_addr.ip());
+    let (cert, key) = tls_cert::self_signed("localhost", Some(upstream_addr.ip()));
     let acceptor = tls_cert::acceptor(&cert, &key);
     let trust = CertStore::builder()
         .add_der_cert(&cert.to_der().unwrap())

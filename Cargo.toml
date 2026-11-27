@@ -10,7 +10,7 @@ authors = ["0x676e67 <gngppz@gmail.com>"]
 readme = "README.md"
 license = "Apache-2.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 include = ["/README.md", "/LICENSE", "/src/**/*.rs"]
 
 [package.metadata.docs.rs]
@@ -84,6 +84,9 @@ ws = ["dep:tokio-tungstenite", "tokio-tungstenite?/handshake"]
 # Use static Mozilla root certificates for TLS verification (default).
 webpki-roots = ["dep:webpki-root-certs"]
 
+# Merge the OS trust store with any enabled bundled root stores.
+native-roots = ["dep:rustls-native-certs"]
+
 # Use static Chromium Root Store certificates for TLS verification.
 chromium-roots = ["dep:chromium-roots"]
 
@@ -101,10 +104,11 @@ parking_lot = ["dep:parking_lot", "http2?/parking_lot"]
 prefix-symbols = ["btls/prefix-symbols"]
 
 [dependencies]
+base64 = "0.23"
 url = "2.5.8"
 bytes = "1.11.1"
 http = "1.4.0"
-http2 = { version = "0.5.17", optional = true }
+http2 = { version = "0.5.20", git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1", optional = true }
 httparse = "1.10.1"
 http-body = "1.0.1"
 http-body-util = "0.1.4"
@@ -114,13 +118,13 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.19.0"
-btls = "0.5.6"
-btls-sys = "0.5.6"
-tokio-btls = "0.5.6"
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
+btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
-netty = { version = "0.2.5", default-features = false }
+netty = { version = "0.2.5", git = "https://github.com/codeandsolder/cargo-patches.git", tag = "wreq-transport-v0.0.1", default-features = false }
 tower = { version = "0.5.3", default-features = false, features = [
     "timeout",
     "util",
@@ -146,6 +150,7 @@ sync_wrapper = { version = "1.0.2", optional = true }
 
 ## webpki root certs
 webpki-root-certs = { version = "1.0.7", optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
 
 ## Chromium root certs
 chromium-roots = { version = "0.1.1", optional = true }
@@ -397,8 +402,6 @@ name = "unix_socket"
 path = "examples/unix_socket.rs"
 
 [patch.crates-io]
-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
-btls-sys = { git = "https://github.com/0x676e67/btls", branch = "main" }
-tokio-btls = { git = "https://github.com/0x676e67/btls", branch = "main" }
-http2 = { git = "https://github.com/0x676e67/http2", branch = "master" }
-netty = { git = "https://github.com/0x676e67/netty", branch = "main" }
+
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
+[workspace]

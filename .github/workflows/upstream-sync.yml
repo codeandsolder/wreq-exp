@@ -1,0 +1,23 @@
+name: Follow upstream
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    uses: codeandsolder/ci-workflows/.github/workflows/upstream-tracking.yml@c9cff3b64df2fb2295270a09e8e38dbf18e31daf # main
+    with:
+      upstream-repository: 0x676e67/wreq
+      upstream-branch: main
+      target-branch: main
+      workflow-policy: preserve
+      rust-toolchain: repository
+      go: true
+      validation-script: .github/scripts/validate-upstream.sh
+      timeout-minutes: 60

@@ -315,6 +315,8 @@ mod client;
 mod conn;
 mod error;
 mod group;
+#[cfg(feature = "http2")]
+mod http2_info;
 mod into_uri;
 mod proxy;
 mod rt;
@@ -368,6 +370,8 @@ pub mod http2 {
         },
     };
     pub use netty::http2::{Http2Options, Http2OptionsBuilder};
+
+    pub use crate::http2_info::{Http2Info, Http2Setting};
 }
 
 pub use http::{Method, StatusCode, Uri, Version};
