@@ -103,6 +103,9 @@ parking_lot = ["dep:parking_lot", "http2?/parking_lot"]
 # when multiple OpenSSL versions coexist in the same process.
 prefix-symbols = ["btls/prefix-symbols"]
 
+# Bundle the target C++ runtime for portable Linux executables.
+static-cxx-runtime = ["btls/static-cxx-runtime"]
+
 [dependencies]
 base64 = "0.23"
 url = "2.5.8"
@@ -118,9 +121,9 @@ futures-util = { version = "0.3.33", default-features = false }
 socket2 = { version = "0.6.3", features = ["all"] }
 ipnet = "2.12.0"
 lru = "0.19.0"
-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
-btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
-tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "a4b12ba7391e03470626504fad60d887be790cfb" }
+btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "c94b59be27af2bcd8531cc005fd1ea6fdd281bcb" }
+btls-sys = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "c94b59be27af2bcd8531cc005fd1ea6fdd281bcb" }
+tokio-btls = { git = "https://github.com/codeandsolder/btls-fast.git", rev = "c94b59be27af2bcd8531cc005fd1ea6fdd281bcb" }
 tokio = { version = "1.52.3", default-features = false, features = ["io-util", "sync"] }
 compio = { version = "0.19.2", features = ["io", "io-compat"], optional = true }
 send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
