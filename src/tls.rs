@@ -9,6 +9,15 @@ pub mod keylog;
 pub mod session;
 pub mod trust;
 
+/// Native TLS provider used by this client. Use these re-exports when
+/// interoperating with the underlying certificate, key or TLS stream APIs.
+/// This keeps native linkage and Rust type identity on the same provider
+/// revision as the client, without a second independently resolved Git pin.
+pub mod backend {
+    pub use btls;
+    pub use tokio_btls;
+}
+
 use std::borrow::Cow;
 
 /// Re-exports of TLS-related types from `btls` for public use.
