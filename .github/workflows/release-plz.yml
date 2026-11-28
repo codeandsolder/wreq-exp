@@ -29,7 +29,7 @@ jobs:
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.99.0
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@5635824a189d1a1d80b2834a08f8b8fbb9452186 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
 
       - name: Run release-plz
         id: release-plz
@@ -41,7 +41,7 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@5635824a189d1a1d80b2834a08f8b8fbb9452186 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
 
   release-plz-pr:
     name: Release-plz PR
@@ -84,7 +84,7 @@ jobs:
                   output.write(f"path={config}\n")
           PY
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@5635824a189d1a1d80b2834a08f8b8fbb9452186 # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
 
       - name: Run release-plz
         uses: release-plz/action@v0.5
@@ -96,4 +96,4 @@ jobs:
 
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@5635824a189d1a1d80b2834a08f8b8fbb9452186 # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main

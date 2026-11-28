@@ -12,6 +12,6 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   dependency-gate:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-dependency-gate.yml@5635824a189d1a1d80b2834a08f8b8fbb9452186 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-dependency-gate.yml@97a50dd3304be8cf19738aa1c027ac4ecd1f3d2b # main
     with:
       working-directories: '["."]'
